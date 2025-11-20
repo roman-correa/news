@@ -1,7 +1,7 @@
 from io import BytesIO
 import streamlit as st
 import pandas as pd
-import joblib
+
 import geopandas as gpd
 import plotly.express as px
 import pickle
