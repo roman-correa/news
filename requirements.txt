@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+geopandas
+plotly
+xgboost
+catboost
+scikit-learn
+shapely
+pyproj
+fiona
+protobuf
