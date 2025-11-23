@@ -56,8 +56,8 @@ sales = load_csv('ven_mede_final.csv')
 gdf = load_geojson('medellin.geojson')
 
 # Normalize barrio names in dataframes for safe merges
-loan['barrio_norm'] = loan['barrio'].astype(str).str.strip().str.lower()
-sales['barrio_norm'] = sales['barrio'].astype(str).str.strip().str.lower()
+loan['barrio_norm'] = loan['nombre'].astype(str).str.strip().str.lower()
+sales['barrio_norm'] = sales['nombre'].astype(str).str.strip().str.lower()
 
 # -----------------------------
 # Prediction functions (robust)
@@ -236,6 +236,7 @@ quick_habs = st.sidebar.number_input(
     'Habitaciones', 0, 10, 2, key='quick_habs')
 quick_banos = st.sidebar.number_input('Baños', 0, 10, 2, key='quick_banos')
 quick_parq = st.sidebar.number_input('Parqueaderos', 0, 5, 1, key='quick_parq')
+
 if st.sidebar.button('Predecir (rápido)'):
     if quick_mode == 'Arriendo':
         val, err = predict_arr(
@@ -277,9 +278,9 @@ if mode in ['Arriendo', 'Venta']:
         st.subheader('Contexto del barrio')
         # neighborhood statistics summary
         barrio_norm = barrio.strip().lower()
-        arr_b = loan[loan['barrio'].astype(
+        arr_b = loan[loan['nombre'].astype(
             str).str.strip().str.lower() == barrio_norm]
-        ven_b = sales[sales['barrio'].astype(
+        ven_b = sales[sales['nombre'].astype(
             str).str.strip().str.lower() == barrio_norm]
         st.metric('Listings arriendo (count)', len(arr_b))
         st.metric('Listings venta (count)', len(ven_b))
@@ -297,7 +298,7 @@ elif mode == 'Explorar datos':
 
     # Apply sidebar filters
     if selected_barrio != 'Todos':
-        df = df[df['barrio'].str.strip().str.lower() ==
+        df = df[df['nombre'].str.strip().str.lower() ==
                 selected_barrio.strip().lower()]
     df = df[(df['precio'] >= min_price) & (df['precio'] <= max_price)]
 
@@ -325,17 +326,16 @@ elif mode == 'Explorar datos':
 elif mode == 'Mapa de oportunidades':
     st.header('Mapa de oportunidades')
     # Create an aggregated metric per barrio (percentage underpriced)
-    summary = sales.groupby(sales['barrio'].astype(str).str.strip().str.lower()).agg(
+    summary = sales.groupby(sales['nombre'].astype(str).str.strip().str.lower()).agg(
         count=('precio', 'count'),
         median_price=('precio', 'median'),
         percent_under=('oportunity_houses', 'mean')
     ).reset_index()
     summary['percent_under'] = summary['percent_under'] * 100
-    summary.rename(columns={'barrio': 'barrio_norm'}, inplace=True)
+    summary.rename(columns={'nombre': 'barrio_norm'}, inplace=True)
 
     # merge to geojson
-    gdf['barrio_norm'] = gdf.get('barrio', gdf.get(
-        'name', '')).astype(str).str.strip().str.lower()
+    gdf['barrio_norm'] = gdf.get('nombre', gdf.get('name', '')).astype(str).str.strip().str.lower()
     merged = gdf.merge(summary, on='barrio_norm', how='left')
 
     # fallback zeros
