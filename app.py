@@ -215,6 +215,7 @@ st.sidebar.title('Controles')
 mode = st.sidebar.radio(
     'Modo', ['Arriendo', 'Venta', 'Explorar datos', 'Mapa de oportunidades'])
 
+
 # Filters common to explorers
 selected_barrio = st.sidebar.selectbox(
     'Barrio (filtro)', ['Todos'] + sorted(list_barrios))
@@ -315,7 +316,7 @@ elif mode == 'Explorar datos':
     with c2:
         if 'area' in df.columns and len(df):
             fig2 = px.scatter(df, x='area', y='precio', hover_data=[
-                              'barrio', 'tipo'], title='Precio vs Área')
+                              'nombre', 'tipo'], title='Precio vs Área')
             st.plotly_chart(fig2, use_container_width=True)
 
     # download filtered data
@@ -325,24 +326,28 @@ elif mode == 'Explorar datos':
 
 elif mode == 'Mapa de oportunidades':
     st.header('Mapa de oportunidades')
-    # Create an aggregated metric per barrio (percentage underpriced)
-    summary = sales.groupby(sales['nombre'].astype(str).str.strip().str.lower()).agg(
+
+    # --- AGREGAR RESUMEN DE BARRIOS ---
+    summary = sales.groupby(
+        sales['nombre'].astype(str).str.strip().str.lower()
+    ).agg(
         count=('precio', 'count'),
         median_price=('precio', 'median'),
         percent_under=('oportunity_houses', 'mean')
     ).reset_index()
-    summary['percent_under'] = summary['percent_under'] * 100
+
+    summary['percent_under'] *= 100
     summary.rename(columns={'nombre': 'barrio_norm'}, inplace=True)
 
-    # merge to geojson
-    gdf['barrio_norm'] = gdf.get('nombre', gdf.get('name', '')).astype(str).str.strip().str.lower()
+    # unir con geojson
+    gdf['barrio_norm'] = gdf.get('nombre', gdf.get('name', '').strip().lower())
     merged = gdf.merge(summary, on='barrio_norm', how='left')
 
-    # fallback zeros
-    merged['percent_under'] = merged['percent_under'].fillna(0)
-    merged['count'] = merged['count'].fillna(0)
-    merged['median_price'] = merged['median_price'].fillna(0)
+    merged[['percent_under', 'count', 'median_price']] = (
+        merged[['percent_under', 'count', 'median_price']].fillna(0)
+    )
 
+    # --- MAPA CHOROPLETH ---
     st.subheader('Choropleth - porcentaje de listings subvalorados (venta)')
     fig = px.choropleth_mapbox(
         merged,
@@ -350,28 +355,76 @@ elif mode == 'Mapa de oportunidades':
         locations=merged.index,
         color='percent_under',
         mapbox_style='carto-positron',
-        center={'lat': merged.geometry.centroid.y.mean(
-        ), 'lon': merged.geometry.centroid.x.mean()},
+        center=dict(
+            lat=merged.geometry.centroid.y.mean(),
+            lon=merged.geometry.centroid.x.mean()
+        ),
         zoom=10,
         hover_data=['barrio_norm', 'count', 'median_price', 'percent_under']
     )
-    fig.update_layout(margin={'r': 0, 't': 0, 'l': 0,
-                      'b': 0}, mapbox_accesstoken=None)
+    fig.update_layout(margin={'r': 0, 't': 0, 'l': 0, 'b': 0})
+
     st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown('### Tabla de barrios con más oportunidades')
-    top = summary.sort_values('percent_under', ascending=False).head(20)
-    st.table(top)
-
-    # allow downloading opportunities
+    # --- TABLA DE OPORTUNIDADES ---
+    st.markdown('### Propiedades oportunidad')
     opp = sales[sales['oportunity_houses']].copy()
-    st.markdown(f'Propiedades de venta marcadas como oportunidad: {len(opp)}')
+
+    cols_show = ["id", "nombre", "tipo", "precio", "area",
+                 "habitaciones", "baños", "parqueaderos",
+                 "latitud", "longitud"]
+
+    cols_show = [c for c in cols_show if c in opp.columns]
+
+    selected = st.data_editor(
+        opp[cols_show],
+        height=350,
+        use_container_width=True,
+        key="opp_selector"
+    )
+
+    # --- SI UNA PROPIEDAD ES SELECCIONADA: MOSTRAR MAPA ---
+    if isinstance(selected, pd.DataFrame) and len(selected) == 1:
+        prop = selected.iloc[0]
+
+        st.subheader("📍 Ubicación de la propiedad seleccionada")
+
+        if "latitud" in prop and "longitud" in prop:
+            df_point = pd.DataFrame({
+                "lat": [prop["latitud"]],
+                "lon": [prop["longitud"]],
+                "label": [f"{prop['tipo']} - ${prop['precio']:,.0f}"]
+            })
+
+            fig2 = px.scatter_mapbox(
+                df_point,
+                lat="lat",
+                lon="lon",
+                size=[30],
+                hover_name="label",
+                zoom=16,
+                mapbox_style="carto-positron"
+            )
+
+            fig2.update_layout(margin={"r": 0, "t": 0, "l": 0, "b": 0})
+
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.error("Esta propiedad no tiene latitud/longitud.")
+
+    # --- DESCARGA ---
     csv2 = opp.to_csv(index=False).encode('utf-8')
-    st.download_button('Descargar oportunidades (venta)', data=csv2,
-                       file_name='oportunidades_venta.csv', mime='text/csv')
+    st.download_button(
+        'Descargar oportunidades (venta)',
+        data=csv2,
+        file_name='oportunidades_venta.csv',
+        mime='text/csv'
+    )
+
+
 
 # -----------------------------
 # Footer / tips
 # -----------------------------
 st.markdown('---')
-st.caption('App creada por tu asistente — pide ajustes (UI, métricas, despliegue).')
+st.caption('App creada por Roman Alejandro.')
