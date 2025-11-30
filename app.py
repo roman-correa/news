@@ -427,4 +427,4 @@ elif mode == 'Mapa de oportunidades':
 # Footer / tips
 # -----------------------------
 st.markdown('---')
-st.caption('App creada por Roman Alejandro.')
+st.caption('App creada por Roman Alejandro Correa.')
