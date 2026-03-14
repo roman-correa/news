@@ -1,13 +1,18 @@
-streamlit
-pandas
-numpy
-geopandas
-plotly
-xgboost
-catboost
-scikit-learn
-shapely
-pyproj
-fiona
-protobuf
-pickle5
+# ── Core data & ML ───────────────────────────────────────────────
+numpy>=1.26,<3
+pandas>=2.1,<4
+scikit-learn>=1.4,<2
+xgboost>=2.0,<3
+scikit-optimize>=0.10,<1        # BayesSearchCV
+
+# ── Geospatial ────────────────────────────────────────────────────
+geopandas>=0.14,<2
+shapely>=2.0,<3
+
+# ── App & visualisation ───────────────────────────────────────────
+streamlit>=1.35,<2
+plotly>=5.20,<6
+
+# ── Scraping & utilities ──────────────────────────────────────────
+requests>=2.31,<3
+rapidfuzz>=3.6,<4
