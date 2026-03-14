@@ -2,6 +2,7 @@
 Compra/Venta Medellín — Real Estate Price Predictor
 Author: Roman Alejandro Correa
 """
+from io import BytesIO
 import streamlit as st
 import pandas as pd
 import geopandas as gpd
@@ -9,15 +10,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 import pickle
 import numpy as np
-from pathlib import Path
-
-# Artifacts can live in ./artifacts/ (after train.py) or ./ (legacy flat layout)
-
-
-def _artifact(name: str) -> str:
-    p = Path("artifacts") / name
-    return str(p) if p.exists() else name
-
 
 # ─────────────────────────────────────────────
 # Page config  (must be first Streamlit call)
@@ -201,58 +193,24 @@ def load_geojson(path: str):
 
 # ─────────────────────────────────────────────
 # Load artifacts
-# train.py saves two preprocessors (arr + ven).
-# Legacy flat layout has one shared preprocessor.pkl — we fall back to it
-# for both if the split versions don't exist yet.
 # ─────────────────────────────────────────────
-arr_cats = load_pickle(_artifact("best_features_arr.pkl"))
-ven_cats = load_pickle(_artifact("best_features_ven.pkl"))
-xgb_arr = load_pickle(_artifact("xgb_model_arr_med.pkl"))
-xgb_ven = load_pickle(_artifact("xgb_model_ven_med.pkl"))
-list_barrios = load_pickle(_artifact("list_barrios.pkl"))
-ppmc_arr = load_pickle(_artifact("price_per_m2_arr.pkl"))
-ppmc_ven = load_pickle(_artifact("price_per_m2_ven.pkl"))
-pppz_arr = load_pickle(_artifact("price_per_space_arr.pkl"))
-pppz_ven = load_pickle(_artifact("price_per_space_ven.pkl"))
-pppp_arr = load_pickle(_artifact("price_per_parking_arr.pkl"))
-pppp_ven = load_pickle(_artifact("price_per_parking_ven.pkl"))
-barrio_te_arr = load_pickle(_artifact("barrio_te_arr.pkl"))
-barrio_te_ven = load_pickle(_artifact("barrio_te_ven.pkl"))
+arr_cats          = load_pickle("best_features_arr.pkl")
+ven_cats          = load_pickle("best_features_ven.pkl")
+xgb_arr           = load_pickle("xgb_model_arr_med.pkl")
+xgb_ven           = load_pickle("xgb_model_ven_med.pkl")
+cat_arr           = load_pickle("cat_model_arr_med.pkl")
+list_barrios      = load_pickle("list_barrios.pkl")
+ppmc_ven          = load_pickle("price_per_m2_ven.pkl")
+pppz_ven          = load_pickle("price_per_space_ven.pkl")
+ppmc_arr          = load_pickle("price_per_m2_arr.pkl")
+pppz_arr          = load_pickle("price_per_space_arr.pkl")
+pppp_arr          = load_pickle("price_per_parking_arr.pkl")
+pppp_ven          = load_pickle("price_per_parking_ven.pkl")
+preprocessor      = load_pickle("preprocessor.pkl")
 
-# Preprocessor: prefer split versions, fall back to legacy single file
-_pp_arr_path = _artifact("preprocessor_arr.pkl")
-_pp_ven_path = _artifact("preprocessor_ven.pkl")
-_pp_legacy = _artifact("preprocessor.pkl")
-preprocessor_arr = load_pickle(_pp_arr_path if Path(
-    _pp_arr_path).exists() else _pp_legacy)
-preprocessor_ven = load_pickle(_pp_ven_path if Path(
-    _pp_ven_path).exists() else _pp_legacy)
-
-# cat_model is optional (only exists in legacy layout)
-try:
-    cat_arr = load_pickle(_artifact("cat_model_arr_med.pkl"))
-    _has_cat = True
-except Exception:
-    _has_cat = False
-
-loan = load_csv(_artifact("arr_mede_final.csv"))
-sales = load_csv(_artifact("ven_mede_final.csv"))
-gdf = load_geojson("medellin.geojson")
-
-# ─────────────────────────────────────────────
-# Constants (must match train.py exactly)
-# ─────────────────────────────────────────────
-NUM_ATTRIBS = [
-    "area",
-    "baños", "parqueaderos", "espacios", "pppz", "garaje_bin",
-    "ppmc", "axe", "axh", "axa", "new_index", "parq2",
-    "pppp", "pppp/pppz", "pppp/ppmc", "pppz/ppmc",
-    "barrio_te",
-]
-CAT_ATTRIBS = ["tipo"]
-
-# Model performance on held-out test set (log-space R²)
-MODEL_R2 = {"arr": 0.7840, "ven": 0.8567}
+loan  = load_csv("arr_mede_final.csv")
+sales = load_csv("ven_mede_final.csv")
+gdf   = load_geojson("medellin.geojson")
 
 # Normalize barrio names once
 for df in [loan, sales]:
@@ -265,29 +223,22 @@ for df in [loan, sales]:
 @st.cache_data(ttl=3600)
 def add_opportunity_labels(_loan, _sales):
     """Return loan and sales DataFrames with opportunity columns added."""
-    loan_c = _loan.copy()
+    loan_c  = _loan.copy()
     sales_c = _sales.copy()
 
-    # Arriendo — use xgb_arr (or cat_arr if available) with its own preprocessor
-    loan_std = preprocessor_arr.transform(loan_c[NUM_ATTRIBS + CAT_ATTRIBS])
-    loan_std = pd.DataFrame(
-        loan_std, columns=preprocessor_arr.get_feature_names_out())
-    opp_model = cat_arr if _has_cat else xgb_arr
-    loan_c["cat_pred"] = np.expm1(opp_model.predict(loan_std[arr_cats]))
-    loan_c["is_underpriced"] = loan_c["precio"] < loan_c["cat_pred"]
-    loan_c["pct_underpriced"] = (
-        loan_c["cat_pred"] - loan_c["precio"]) / loan_c["cat_pred"] * 100
-    loan_c["oportunity_houses"] = loan_c["pct_underpriced"] > 20
+    loan_std = preprocessor.transform(loan_c)
+    loan_std = pd.DataFrame(loan_std, columns=preprocessor.get_feature_names_out())
+    loan_c["cat_pred"]              = np.exp(cat_arr.predict(loan_std[arr_cats]))
+    loan_c["is_underpriced"]        = loan_c["precio"] < loan_c["cat_pred"]
+    loan_c["pct_underpriced"]       = (loan_c["cat_pred"] - loan_c["precio"]) / loan_c["cat_pred"] * 100
+    loan_c["oportunity_houses"]     = loan_c["pct_underpriced"] > 20
 
-    # Venta — use xgb_ven with its own preprocessor
-    sales_std = preprocessor_ven.transform(sales_c[NUM_ATTRIBS + CAT_ATTRIBS])
-    sales_std = pd.DataFrame(
-        sales_std, columns=preprocessor_ven.get_feature_names_out())
-    sales_c["cat_pred"] = np.expm1(xgb_ven.predict(sales_std[ven_cats]))
-    sales_c["is_underpriced"] = sales_c["precio"] < sales_c["cat_pred"]
-    sales_c["pct_underpriced"] = (
-        sales_c["cat_pred"] - sales_c["precio"]) / sales_c["cat_pred"] * 100
-    sales_c["oportunity_houses"] = sales_c["pct_underpriced"] > 20
+    sales_std = preprocessor.transform(sales_c)
+    sales_std = pd.DataFrame(sales_std, columns=preprocessor.get_feature_names_out())
+    sales_c["cat_pred"]             = np.exp(xgb_ven.predict(sales_std[ven_cats]))
+    sales_c["is_underpriced"]       = sales_c["precio"] < sales_c["cat_pred"]
+    sales_c["pct_underpriced"]      = (sales_c["cat_pred"] - sales_c["precio"]) / sales_c["cat_pred"] * 100
+    sales_c["oportunity_houses"]    = sales_c["pct_underpriced"] > 20
 
     return loan_c, sales_c
 
@@ -299,18 +250,14 @@ loan, sales = add_opportunity_labels(loan, sales)
 # Feature engineering helper
 # ─────────────────────────────────────────────
 def _build_input_df(area, habitaciones, banos, parqueaderos, barrio, tipo, kind="arr") -> pd.DataFrame:
-    """
-    Return a single-row DataFrame with exactly NUM_ATTRIBS + CAT_ATTRIBS columns
-    so it can be passed directly to preprocessor.transform().
-    """
     ppmc = ppmc_arr if kind == "arr" else ppmc_ven
     pppz = pppz_arr if kind == "arr" else pppz_ven
     pppp = pppp_arr if kind == "arr" else pppp_ven
 
     espacios = habitaciones + parqueaderos + banos
-    axe = area / espacios if espacios else np.nan
-    axh = area / habitaciones if habitaciones else np.nan
-    axa = area ** 2
+    axe  = area / espacios if espacios else np.nan
+    axh  = area / habitaciones if habitaciones else np.nan
+    axa  = area ** 2
     parq2 = parqueaderos ** 2
 
     barrio_ppmc = ppmc.get(barrio, np.nan)
@@ -318,38 +265,32 @@ def _build_input_df(area, habitaciones, banos, parqueaderos, barrio, tipo, kind=
     barrio_pppp = pppp.get(barrio, np.nan)
 
     def safe_ratio(a, b):
-        try:
-            return float(a / b) if b and not np.isnan(float(b)) and b != 0 else 1.0
-        except Exception:
-            return 1.0
+        if b and not np.isnan(b) and b != 0:
+            return a / b
+        return 1.0
 
-    ppmc_max = float(ppmc.max()) if hasattr(ppmc, "max") and len(ppmc) else 1.0
-    new_index = (barrio_ppmc / ppmc_max * 100) if ppmc_max else 0.0
-
-    # Target encoding lookup — fall back to global mean if barrio unseen
-    te_map = barrio_te_arr if kind == "arr" else barrio_te_ven
-    barrio_te = te_map.get(barrio, float(te_map.mean()))
-
-    # Keys must match NUM_ATTRIBS order first, then CAT_ATTRIBS
     row = {
-        "area":         area,
-        "baños":        banos,
+        "habitaciones": habitaciones,
+        "baños": banos,
         "parqueaderos": parqueaderos,
-        "espacios":     espacios,
-        "pppz":         barrio_pppz,
-        "garaje_bin":   1 if parqueaderos > 0 else 0,
-        "ppmc":         barrio_ppmc,
-        "axe":          axe,
-        "axh":          axh,
-        "axa":          axa,
-        "new_index":    new_index,
-        "parq2":        parq2,
-        "pppp":         barrio_pppp,
-        "pppp/pppz":    safe_ratio(barrio_pppp, barrio_pppz),
-        "pppp/ppmc":    safe_ratio(barrio_pppp, barrio_ppmc),
-        "pppz/ppmc":    safe_ratio(barrio_pppz, barrio_ppmc),
-        "barrio_te":    barrio_te,
-        "tipo":         tipo,
+        "espacios": espacios,
+        "axe": axe,
+        "tipo": tipo,
+        "ppmc": barrio_ppmc,
+        "pppz": barrio_pppz,
+        "pppp": barrio_pppp,
+        "garaje_bin": 1 if parqueaderos > 0 else 0,
+        "parq2": parq2,
+        "new_index": (barrio_ppmc / ppmc_arr.get("max_ppmc", barrio_ppmc + 1)) * 100
+                     if kind == "arr" else
+                     (barrio_ppmc / ppmc_ven.get("max_ppmc", barrio_ppmc + 1)) * 100,
+        "area": area,
+        "barrio": barrio,
+        "axh": axh,
+        "axa": axa,
+        "pppp/pppz": safe_ratio(barrio_pppp, barrio_pppz),
+        "pppp/ppmc": safe_ratio(barrio_pppp, barrio_ppmc),
+        "pppz/ppmc": safe_ratio(barrio_pppz, barrio_ppmc),
     }
     return pd.DataFrame([row])
 
@@ -374,18 +315,14 @@ def predict(area, habitaciones, banos, parqueaderos, barrio, tipo, kind="arr") -
     if err:
         return None, None, err
 
-    input_df = _build_input_df(
-        area, habitaciones, banos, parqueaderos, barrio, tipo, kind)
-
-    # Use the correct preprocessor for each transaction type
-    pp = preprocessor_arr if kind == "arr" else preprocessor_ven
-    cats = arr_cats if kind == "arr" else ven_cats
-    model = xgb_arr if kind == "arr" else xgb_ven
-
-    X = pp.transform(input_df[NUM_ATTRIBS + CAT_ATTRIBS])
+    input_df = _build_input_df(area, habitaciones, banos, parqueaderos, barrio, tipo, kind)
+    X = preprocessor.transform(input_df)
     if hasattr(X, "toarray"):
         X = X.toarray()
-    X = pd.DataFrame(X, columns=pp.get_feature_names_out())
+    X = pd.DataFrame(X, columns=preprocessor.get_feature_names_out())
+
+    cats = arr_cats if kind == "arr" else ven_cats
+    model = xgb_arr if kind == "arr" else xgb_ven
 
     missing = [c for c in cats if c not in X.columns]
     if missing:
@@ -393,7 +330,7 @@ def predict(area, habitaciones, banos, parqueaderos, barrio, tipo, kind="arr") -
 
     raw_pred = model.predict(X[cats])
     price = float(np.expm1(raw_pred)[0])
-    ppm2 = price / area if area else None
+    ppm2  = price / area if area else None
     return price, ppm2, None
 
 
@@ -403,8 +340,8 @@ def predict(area, habitaciones, banos, parqueaderos, barrio, tipo, kind="arr") -
 def get_barrio_stats(barrio: str) -> dict:
     """Return a dict of median/count stats for a neighbourhood."""
     bn = barrio.strip().lower()
-    arr_b = loan[loan["barrio_norm"] == bn]
-    ven_b = sales[sales["barrio_norm"] == bn]
+    arr_b  = loan[loan["barrio_norm"] == bn]
+    ven_b  = sales[sales["barrio_norm"] == bn]
     return {
         "arr_count":  len(arr_b),
         "ven_count":  len(ven_b),
@@ -432,21 +369,17 @@ def fmt_price(v: float | None, fallback="—") -> str:
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 🏙️ Medellín RE")
-    st.markdown("<div class='section-header'>Navegación</div>",
-                unsafe_allow_html=True)
+    st.markdown("<div class='section-header'>Navegación</div>", unsafe_allow_html=True)
     mode = st.radio(
         "Sección",
         ["🔮 Predictor", "📊 Explorar datos", "🗺️ Mapa de oportunidades"],
         label_visibility="collapsed",
     )
 
-    st.markdown("<div class='section-header'>Filtros globales</div>",
-                unsafe_allow_html=True)
+    st.markdown("<div class='section-header'>Filtros globales</div>", unsafe_allow_html=True)
     selected_barrio = st.selectbox("Barrio", ["Todos"] + sorted(list_barrios))
-    min_price = st.number_input(
-        "Precio mínimo (COP)", value=0, step=1_000_000, format="%d")
-    max_price = st.number_input(
-        "Precio máximo (COP)", value=2_000_000_000, step=1_000_000, format="%d")
+    min_price = st.number_input("Precio mínimo (COP)", value=0, step=1_000_000, format="%d")
+    max_price = st.number_input("Precio máximo (COP)", value=2_000_000_000, step=1_000_000, format="%d")
 
     st.markdown("---")
     st.caption("Por Roman Alejandro Correa")
@@ -457,64 +390,39 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 if mode == "🔮 Predictor":
     st.markdown("## Predictor de precios")
-    st.markdown(
-        "Estima el precio de arriendo o venta de una propiedad en Medellín.")
+    st.markdown("Estima el precio de arriendo o venta de una propiedad en Medellín.")
 
-    kind_label = st.segmented_control(
-        "Tipo de transacción", ["Arriendo", "Venta"], default="Arriendo")
+    kind_label = st.segmented_control("Tipo de transacción", ["Arriendo", "Venta"], default="Arriendo")
     kind = "arr" if kind_label == "Arriendo" else "ven"
-
-    # ── R² badge — updates when user switches Arriendo / Venta ──
-    r2_val = MODEL_R2[kind]
-    r2_color = "#0fd4c0" if r2_val >= 0.75 else "#f59e0b" if r2_val >= 0.5 else "#ef4444"
-    r2_desc = "Excelente" if r2_val >= 0.80 else "Bueno" if r2_val >= 0.70 else "Moderado"
-    st.markdown(
-        f"""<div style='display:inline-flex;align-items:center;gap:10px;
-                background:#0e1828;border:1px solid #1e3a5f;border-radius:8px;
-                padding:8px 16px;margin-bottom:16px;'>
-            <span style='font-size:11px;color:#5f8ab0;text-transform:uppercase;
-                         letter-spacing:.08em;'>Precisión del modelo · {kind_label}</span>
-            <span style='font-family:"DM Mono",monospace;font-size:20px;
-                         font-weight:700;color:{r2_color};'>R² {r2_val:.4f}</span>
-            <span style='font-size:11px;color:{r2_color};background:{r2_color}1a;
-                         border-radius:4px;padding:2px 8px;font-weight:600;'>{r2_desc}</span>
-            <span style='font-size:11px;color:#3a6080;'>· evaluado en conjunto de prueba (log-space)</span>
-        </div>""",
-        unsafe_allow_html=True,
-    )
 
     col_form, col_result = st.columns([1, 1], gap="large")
 
     with col_form:
-        st.markdown(
-            "<div class='section-header'>Datos de la propiedad</div>", unsafe_allow_html=True)
-        barrio = st.selectbox("Barrio", list_barrios)
-        tipo = st.selectbox("Tipo", sorted(loan["tipo"].unique()))
-        area = st.slider("Área (m²)", 20, 500, 80)
+        st.markdown("<div class='section-header'>Datos de la propiedad</div>", unsafe_allow_html=True)
+        barrio      = st.selectbox("Barrio", list_barrios)
+        tipo        = st.selectbox("Tipo", sorted(loan["tipo"].unique()))
+        area        = st.slider("Área (m²)", 20, 500, 80)
         col_a, col_b = st.columns(2)
         with col_a:
             habitaciones = st.number_input("Habitaciones", 0, 10, 2)
-            banos = st.number_input("Baños", 0, 10, 2)
+            banos        = st.number_input("Baños", 0, 10, 2)
         with col_b:
             parqueaderos = st.number_input("Parqueaderos", 0, 5, 1)
 
-        predict_btn = st.button("Predecir precio →",
-                                type="primary", use_container_width=True)
+        predict_btn = st.button("Predecir precio →", type="primary", use_container_width=True)
 
     with col_result:
-        st.markdown("<div class='section-header'>Resultado</div>",
-                    unsafe_allow_html=True)
+        st.markdown("<div class='section-header'>Resultado</div>", unsafe_allow_html=True)
 
         if predict_btn:
             with st.spinner("Calculando..."):
-                price, ppm2, err = predict(
-                    area, habitaciones, banos, parqueaderos, barrio, tipo, kind)
+                price, ppm2, err = predict(area, habitaciones, banos, parqueaderos, barrio, tipo, kind)
 
             if err:
                 st.error(err)
             else:
                 # Confidence range: ±12% (heuristic based on typical XGBoost RE RMSE)
-                low = price * 0.88
+                low  = price * 0.88
                 high = price * 1.12
 
                 st.markdown(f"""
@@ -527,7 +435,7 @@ if mode == "🔮 Predictor":
 
                 # Price per m²
                 stats = get_barrio_stats(barrio)
-                barrio_ppm2 = stats[f"{'arr' if kind == 'arr' else 'ven'}_ppm2"]
+                barrio_ppm2 = stats[f"{'arr' if kind=='arr' else 'ven'}_ppm2"]
 
                 mc1, mc2 = st.columns(2)
                 with mc1:
@@ -546,8 +454,7 @@ if mode == "🔮 Predictor":
                     </div>""", unsafe_allow_html=True)
 
                 # Feature contribution breakdown
-                st.markdown(
-                    "<div class='section-header'>Factores clave del precio</div>", unsafe_allow_html=True)
+                st.markdown("<div class='section-header'>Factores clave del precio</div>", unsafe_allow_html=True)
 
                 # Approximate feature weights from what we know about the engineered features
                 factors = {
@@ -570,8 +477,7 @@ if mode == "🔮 Predictor":
                     </div>""", unsafe_allow_html=True)
 
                 # Comparables
-                st.markdown(
-                    "<div class='section-header'>Propiedades similares en el barrio</div>", unsafe_allow_html=True)
+                st.markdown("<div class='section-header'>Propiedades similares en el barrio</div>", unsafe_allow_html=True)
                 ref = loan if kind == "arr" else sales
                 comp = ref[
                     (ref["barrio_norm"] == barrio.strip().lower()) &
@@ -580,16 +486,12 @@ if mode == "🔮 Predictor":
                 ].head(5)
 
                 if len(comp):
-                    show_cols = [c for c in ["nombre", "tipo", "precio", "area",
-                                             "habitaciones", "baños", "parqueaderos"] if c in comp.columns]
+                    show_cols = [c for c in ["nombre", "tipo", "precio", "area", "habitaciones", "baños", "parqueaderos"] if c in comp.columns]
                     comp_display = comp[show_cols].copy()
-                    comp_display["precio"] = comp_display["precio"].apply(
-                        fmt_price)
-                    st.dataframe(
-                        comp_display, use_container_width=True, hide_index=True)
+                    comp_display["precio"] = comp_display["precio"].apply(fmt_price)
+                    st.dataframe(comp_display, use_container_width=True, hide_index=True)
                 else:
-                    st.caption(
-                        "No hay comparables con filtros exactos en este barrio.")
+                    st.caption("No hay comparables con filtros exactos en este barrio.")
 
         else:
             st.markdown("""
@@ -599,10 +501,8 @@ if mode == "🔮 Predictor":
             """, unsafe_allow_html=True)
 
             # Show neighbourhood context even before predicting
-            stats = get_barrio_stats(
-                barrio if "barrio" in dir() else list_barrios[0])
-            st.markdown(
-                "<div class='section-header'>Contexto del barrio seleccionado</div>", unsafe_allow_html=True)
+            stats = get_barrio_stats(barrio if "barrio" in dir() else list_barrios[0])
+            st.markdown("<div class='section-header'>Contexto del barrio seleccionado</div>", unsafe_allow_html=True)
             c1, c2 = st.columns(2)
             with c1:
                 st.markdown(f"""
@@ -626,8 +526,7 @@ if mode == "🔮 Predictor":
 elif mode == "📊 Explorar datos":
     st.markdown("## Explorador de datos")
 
-    ds_choice = st.segmented_control(
-        "Dataset", ["Arriendo", "Venta"], default="Arriendo")
+    ds_choice = st.segmented_control("Dataset", ["Arriendo", "Venta"], default="Arriendo")
     df = loan.copy() if ds_choice == "Arriendo" else sales.copy()
 
     # Apply sidebar filters
@@ -638,13 +537,10 @@ elif mode == "📊 Explorar datos":
     # KPI row
     k1, k2, k3, k4 = st.columns(4)
     kpis = [
-        ("Total listings",        f"{len(df):,}",
-         "filtrados"),
+        ("Total listings",        f"{len(df):,}",                     "filtrados"),
         ("Precio mediana",        fmt_price(df['precio'].median()),    "COP"),
-        ("Área mediana",
-         f"{df['area'].median():.0f} m²" if 'area' in df.columns else "—", ""),
-        ("Oportunidades",
-         f"{df['oportunity_houses'].sum():,}" if 'oportunity_houses' in df.columns else "—", ">20% subvaloradas"),
+        ("Área mediana",          f"{df['area'].median():.0f} m²"      if 'area' in df.columns else "—", ""),
+        ("Oportunidades",         f"{df['oportunity_houses'].sum():,}" if 'oportunity_houses' in df.columns else "—", ">20% subvaloradas"),
     ]
     for col, (label, value, sub) in zip([k1, k2, k3, k4], kpis):
         with col:
@@ -655,11 +551,9 @@ elif mode == "📊 Explorar datos":
                 <div class='sub'>{sub}</div>
             </div>""", unsafe_allow_html=True)
 
-    st.markdown("<div class='section-header'>Visualizaciones</div>",
-                unsafe_allow_html=True)
+    st.markdown("<div class='section-header'>Visualizaciones</div>", unsafe_allow_html=True)
 
-    tab1, tab2, tab3 = st.tabs(
-        ["Distribución de precios", "Precio vs Área", "Por barrio"])
+    tab1, tab2, tab3 = st.tabs(["Distribución de precios", "Precio vs Área", "Por barrio"])
 
     with tab1:
         if len(df):
@@ -718,11 +612,9 @@ elif mode == "📊 Explorar datos":
         )
         st.plotly_chart(fig3, use_container_width=True)
 
-    st.markdown("<div class='section-header'>Tabla de datos</div>",
-                unsafe_allow_html=True)
+    st.markdown("<div class='section-header'>Tabla de datos</div>", unsafe_allow_html=True)
     st.dataframe(
-        df.drop(columns=["barrio_norm"], errors="ignore").sample(
-            min(500, len(df))) if len(df) else df,
+        df.drop(columns=["barrio_norm"], errors="ignore").sample(min(500, len(df))) if len(df) else df,
         use_container_width=True,
         height=300,
     )
@@ -741,11 +633,9 @@ elif mode == "📊 Explorar datos":
 # ─────────────────────────────────────────────
 elif mode == "🗺️ Mapa de oportunidades":
     st.markdown("## Mapa de oportunidades")
-    st.markdown(
-        "Barrios y propiedades donde el precio de mercado está por debajo del valor predicho por el modelo.")
+    st.markdown("Barrios y propiedades donde el precio de mercado está por debajo del valor predicho por el modelo.")
 
-    map_mode = st.segmented_control(
-        "Ver", ["Venta", "Arriendo"], default="Venta")
+    map_mode = st.segmented_control("Ver", ["Venta", "Arriendo"], default="Venta")
     df_map = sales if map_mode == "Venta" else loan
 
     # ── Choropleth ──
@@ -762,17 +652,14 @@ elif mode == "🗺️ Mapa de oportunidades":
 
     gdf_work = gdf.copy()
     # Try to find the neighbourhood name column
-    name_col = next(
-        (c for c in ["nombre", "name", "NOMBRE"] if c in gdf_work.columns), None)
+    name_col = next((c for c in ["nombre", "name", "NOMBRE"] if c in gdf_work.columns), None)
     if name_col:
-        gdf_work["barrio_norm"] = gdf_work[name_col].astype(
-            str).str.strip().str.lower()
+        gdf_work["barrio_norm"] = gdf_work[name_col].astype(str).str.strip().str.lower()
     else:
         gdf_work["barrio_norm"] = ""
 
     merged = gdf_work.merge(summary, on="barrio_norm", how="left")
-    merged[["pct_opp", "count", "median_price"]] = merged[[
-        "pct_opp", "count", "median_price"]].fillna(0)
+    merged[["pct_opp", "count", "median_price"]] = merged[["pct_opp", "count", "median_price"]].fillna(0)
 
     fig_choro = px.choropleth_mapbox(
         merged,
@@ -782,14 +669,11 @@ elif mode == "🗺️ Mapa de oportunidades":
         color_continuous_scale="teal",
         range_color=(0, 60),
         mapbox_style="carto-darkmatter",
-        center=dict(lat=merged.geometry.centroid.y.mean(),
-                    lon=merged.geometry.centroid.x.mean()),
+        center=dict(lat=merged.geometry.centroid.y.mean(), lon=merged.geometry.centroid.x.mean()),
         zoom=10.5,
         opacity=0.7,
-        hover_data={"barrio_norm": True, "count": True,
-                    "median_price": True, "pct_opp": ":.1f"},
-        labels={"pct_opp": "% oportunidades",
-                "median_price": "Precio mediana", "count": "Listings"},
+        hover_data={"barrio_norm": True, "count": True, "median_price": True, "pct_opp": ":.1f"},
+        labels={"pct_opp": "% oportunidades", "median_price": "Precio mediana", "count": "Listings"},
         title=f"% de propiedades subvaloradas por barrio — {map_mode}",
     )
     fig_choro.update_layout(
@@ -802,19 +686,16 @@ elif mode == "🗺️ Mapa de oportunidades":
     st.plotly_chart(fig_choro, use_container_width=True)
 
     # ── Opportunity table ──
-    st.markdown("<div class='section-header'>Propiedades oportunidad (>20% subvaloradas)</div>",
-                unsafe_allow_html=True)
+    st.markdown("<div class='section-header'>Propiedades oportunidad (>20% subvaloradas)</div>", unsafe_allow_html=True)
 
     opp = df_map[df_map["oportunity_houses"]].copy()
     if selected_barrio != "Todos":
         opp = opp[opp["barrio_norm"] == selected_barrio.strip().lower()]
     opp = opp[(opp["precio"] >= min_price) & (opp["precio"] <= max_price)]
 
-    st.markdown(
-        f"**{len(opp):,}** propiedades encontradas con descuento potencial > 20%")
+    st.markdown(f"**{len(opp):,}** propiedades encontradas con descuento potencial > 20%")
 
-    show_cols = [c for c in ["nombre", "tipo", "precio", "cat_pred", "pct_underpriced",
-                             "area", "habitaciones", "baños", "parqueaderos", "url"] if c in opp.columns]
+    show_cols = [c for c in ["nombre", "tipo", "precio", "cat_pred", "pct_underpriced", "area", "habitaciones", "baños", "parqueaderos"] if c in opp.columns]
 
     opp_display = opp[show_cols].copy()
     if "precio" in opp_display.columns:
@@ -822,41 +703,26 @@ elif mode == "🗺️ Mapa de oportunidades":
     if "cat_pred" in opp_display.columns:
         opp_display["cat_pred"] = opp_display["cat_pred"].apply(fmt_price)
     if "pct_underpriced" in opp_display.columns:
-        opp_display["pct_underpriced"] = opp_display["pct_underpriced"].apply(
-            lambda x: f"{x:.1f}%")
+        opp_display["pct_underpriced"] = opp_display["pct_underpriced"].apply(lambda x: f"{x:.1f}%")
 
     opp_display = opp_display.rename(columns={
         "nombre": "Barrio", "tipo": "Tipo", "precio": "Precio real",
         "cat_pred": "Precio modelo", "pct_underpriced": "Descuento",
-        "area": "m²", "habitaciones": "Hab", "baños": "Baños",
-        "parqueaderos": "Parq", "url": "Link",
+        "area": "m²", "habitaciones": "Hab", "baños": "Baños", "parqueaderos": "Parq",
     })
 
-    # Build column_config — add clickable link if url column exists
-    col_cfg = {}
-    if "Link" in opp_display.columns:
-        col_cfg["Link"] = st.column_config.LinkColumn(
-            "Link",
-            display_text="Ver →",
-            help="Abrir listado en metrocuadrado.com",
-        )
-
-    st.dataframe(opp_display, use_container_width=True, height=380,
-                 hide_index=True, column_config=col_cfg)
+    st.dataframe(opp_display, use_container_width=True, height=380, hide_index=True)
 
     # ── Scatter: real vs predicted ──
-    st.markdown("<div class='section-header'>Precio real vs. precio estimado por el modelo</div>",
-                unsafe_allow_html=True)
-    scatter_df = df_map[["precio", "cat_pred", "barrio_norm", "tipo",
-                         "oportunity_houses"]].dropna().sample(min(1500, len(df_map)))
+    st.markdown("<div class='section-header'>Precio real vs. precio estimado por el modelo</div>", unsafe_allow_html=True)
+    scatter_df = df_map[["precio", "cat_pred", "barrio_norm", "tipo", "oportunity_houses"]].dropna().sample(min(1500, len(df_map)))
     fig_sc = px.scatter(
         scatter_df,
         x="cat_pred", y="precio",
         color="oportunity_houses",
         color_discrete_map={True: "#0fd4c0", False: "#1e3a5f"},
         hover_data=["barrio_norm", "tipo"],
-        labels={"cat_pred": "Precio modelo", "precio": "Precio real",
-                "oportunity_houses": "Oportunidad"},
+        labels={"cat_pred": "Precio modelo", "precio": "Precio real", "oportunity_houses": "Oportunidad"},
         template="plotly_dark",
         title="Precio real vs estimado — teal = oportunidad",
         opacity=0.7,
