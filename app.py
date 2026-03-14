@@ -10,6 +10,8 @@ import plotly.graph_objects as go
 import pickle
 import numpy as np
 from pathlib import Path
+import datetime
+import requests as _requests
 
 # Artifacts can live in ./artifacts/ (after train.py) or ./ (legacy flat layout)
 
@@ -228,12 +230,7 @@ preprocessor_arr = load_pickle(_pp_arr_path if Path(
 preprocessor_ven = load_pickle(_pp_ven_path if Path(
     _pp_ven_path).exists() else _pp_legacy)
 
-# cat_model is optional (only exists in legacy layout)
-try:
-    cat_arr = load_pickle(_artifact("cat_model_arr_med.pkl"))
-    _has_cat = True
-except Exception:
-    _has_cat = False
+# cat_model_arr_med.pkl is a legacy artifact — new pipeline uses xgb_arr for everything
 
 loan = load_csv(_artifact("arr_mede_final.csv"))
 sales = load_csv(_artifact("ven_mede_final.csv"))
@@ -243,18 +240,56 @@ gdf = load_geojson("medellin.geojson")
 # Constants (must match train.py exactly)
 # ─────────────────────────────────────────────
 NUM_ATTRIBS = [
-    "area",
-    "baños", "parqueaderos", "espacios", "pppz", "garaje_bin",
-    "ppmc", "axe", "axh", "axa", "new_index", "parq2",
-    "pppp", "pppp/pppz", "pppp/ppmc", "pppz/ppmc",
+    "area", "habitaciones", "baños", "parqueaderos", "espacios",
+    "axe", "axh", "axa", "parq2", "garaje_bin",
+    "ppmc", "pppz", "pppp", "new_index",
+    "pppp/pppz", "pppp/ppmc", "pppz/ppmc",
+    "barrio_count",
     "barrio_te",
 ]
 CAT_ATTRIBS = ["tipo"]
 
-# Model performance on held-out test set (log-space R²)
-MODEL_R2 = {"arr": 0.7840, "ven": 0.8567}
 
-# Normalize barrio names once
+@st.cache_data(ttl=3600)
+def compute_r2() -> dict[str, float]:
+    """Compute R² live from loaded models — always reflects the latest retrain."""
+    from sklearn.metrics import r2_score
+    results = {}
+    for kind, df, pp, model, cats in [
+        ("arr", loan,  preprocessor_arr, xgb_arr, arr_cats),
+        ("ven", sales, preprocessor_ven, xgb_ven, ven_cats),
+    ]:
+        try:
+            X = pd.DataFrame(
+                pp.transform(df[NUM_ATTRIBS + CAT_ATTRIBS]),
+                columns=pp.get_feature_names_out(),
+            )
+            available = [c for c in cats if c in X.columns]
+            preds = model.predict(X[available])
+            results[kind] = round(
+                float(r2_score(np.log1p(df["precio"]), preds)), 4)
+        except Exception:
+            results[kind] = float("nan")
+    return results
+
+
+MODEL_R2 = compute_r2()
+
+
+def _data_date() -> str:
+    """Return the modification date of the arriendo CSV as a human string."""
+    try:
+        p = Path(_artifact("arr_mede_final.csv"))
+        ts = p.stat().st_mtime
+        return datetime.datetime.fromtimestamp(ts).strftime("%d %b %Y, %H:%M")
+    except Exception:
+        return "desconocida"
+
+
+DATA_DATE = _data_date()
+
+# barrio_norm = lowercase version of nombre, used only for comparisons
+# nombre itself now keeps original shapefile casing (e.g. "El Poblado")
 for df in [loan, sales]:
     df["barrio_norm"] = df["nombre"].astype(str).str.strip().str.lower()
 
@@ -262,24 +297,40 @@ for df in [loan, sales]:
 # ─────────────────────────────────────────────
 # Opportunity labels (computed once at startup)
 # ─────────────────────────────────────────────
+def _add_derived_features(df: pd.DataFrame, te_map: pd.Series) -> pd.DataFrame:
+    """
+    Compute features that are not stored in the CSV because they require
+    train-only target encoding. Must mirror train.py's prep_dataset exactly.
+    """
+    df = df.copy()
+
+    # Smoothed target encoding — use the map saved by train.py (train rows only)
+    global_mean = float(te_map.mean())
+    df["barrio_te"] = df["nombre"].map(te_map).fillna(global_mean)
+
+    # barrio_count is safe (not price-derived) — already in the CSV from engineer_features
+    # so no need to recompute it here
+
+    return df
+
+
 @st.cache_data(ttl=3600)
 def add_opportunity_labels(_loan, _sales):
     """Return loan and sales DataFrames with opportunity columns added."""
-    loan_c = _loan.copy()
-    sales_c = _sales.copy()
+    loan_c = _add_derived_features(_loan.copy(),  barrio_te_arr)
+    sales_c = _add_derived_features(_sales.copy(), barrio_te_ven)
 
-    # Arriendo — use xgb_arr (or cat_arr if available) with its own preprocessor
+    # Arriendo
     loan_std = preprocessor_arr.transform(loan_c[NUM_ATTRIBS + CAT_ATTRIBS])
     loan_std = pd.DataFrame(
         loan_std, columns=preprocessor_arr.get_feature_names_out())
-    opp_model = cat_arr if _has_cat else xgb_arr
-    loan_c["cat_pred"] = np.expm1(opp_model.predict(loan_std[arr_cats]))
+    loan_c["cat_pred"] = np.expm1(xgb_arr.predict(loan_std[arr_cats]))
     loan_c["is_underpriced"] = loan_c["precio"] < loan_c["cat_pred"]
     loan_c["pct_underpriced"] = (
         loan_c["cat_pred"] - loan_c["precio"]) / loan_c["cat_pred"] * 100
     loan_c["oportunity_houses"] = loan_c["pct_underpriced"] > 20
 
-    # Venta — use xgb_ven with its own preprocessor
+    # Venta
     sales_std = preprocessor_ven.transform(sales_c[NUM_ATTRIBS + CAT_ATTRIBS])
     sales_std = pd.DataFrame(
         sales_std, columns=preprocessor_ven.get_feature_names_out())
@@ -326,30 +377,36 @@ def _build_input_df(area, habitaciones, banos, parqueaderos, barrio, tipo, kind=
     ppmc_max = float(ppmc.max()) if hasattr(ppmc, "max") and len(ppmc) else 1.0
     new_index = (barrio_ppmc / ppmc_max * 100) if ppmc_max else 0.0
 
-    # Target encoding lookup — fall back to global mean if barrio unseen
+    # Target encoding — smoothed, falls back to global mean for unseen barrios
     te_map = barrio_te_arr if kind == "arr" else barrio_te_ven
-    barrio_te = te_map.get(barrio, float(te_map.mean()))
+    barrio_te = float(te_map.get(barrio, te_map.mean()))
 
-    # Keys must match NUM_ATTRIBS order first, then CAT_ATTRIBS
+    # Listing density for the barrio
+    ref = loan if kind == "arr" else sales
+    barrio_count = int((ref["barrio_norm"] == barrio.strip().lower()).sum())
+
+    # Keys must match NUM_ATTRIBS order exactly
     row = {
-        "area":         area,
-        "baños":        banos,
-        "parqueaderos": parqueaderos,
-        "espacios":     espacios,
-        "pppz":         barrio_pppz,
-        "garaje_bin":   1 if parqueaderos > 0 else 0,
-        "ppmc":         barrio_ppmc,
-        "axe":          axe,
-        "axh":          axh,
-        "axa":          axa,
-        "new_index":    new_index,
-        "parq2":        parq2,
-        "pppp":         barrio_pppp,
-        "pppp/pppz":    safe_ratio(barrio_pppp, barrio_pppz),
-        "pppp/ppmc":    safe_ratio(barrio_pppp, barrio_ppmc),
-        "pppz/ppmc":    safe_ratio(barrio_pppz, barrio_ppmc),
-        "barrio_te":    barrio_te,
-        "tipo":         tipo,
+        "area":              area,
+        "habitaciones":      habitaciones,
+        "baños":             banos,
+        "parqueaderos":      parqueaderos,
+        "espacios":          espacios,
+        "axe":               axe,
+        "axh":               axh,
+        "axa":               axa,
+        "parq2":             parq2,
+        "garaje_bin":        1 if parqueaderos > 0 else 0,
+        "ppmc":              barrio_ppmc,
+        "pppz":              barrio_pppz,
+        "pppp":              barrio_pppp,
+        "new_index":         new_index,
+        "pppp/pppz":         safe_ratio(barrio_pppp, barrio_pppz),
+        "pppp/ppmc":         safe_ratio(barrio_pppp, barrio_ppmc),
+        "pppz/ppmc":         safe_ratio(barrio_pppz, barrio_ppmc),
+        "barrio_count":  float(barrio_count),
+        "barrio_te":     barrio_te,
+        "tipo":              tipo,
     }
     return pd.DataFrame([row])
 
@@ -428,6 +485,84 @@ def fmt_price(v: float | None, fallback="—") -> str:
 
 
 # ─────────────────────────────────────────────
+# POI fetcher (Overpass / OpenStreetMap) — no API key needed
+# ─────────────────────────────────────────────
+POI_CATEGORIES = {
+    "🍽️ Restaurantes":      '[amenity~"restaurant|cafe|fast_food"]',
+    "🛒 Supermercados":      '[shop~"supermarket|convenience"]',
+    "🏬 Centro comercial":   '[shop="mall"]',
+    "🏥 Salud":              '[amenity~"hospital|clinic|pharmacy|dentist"]',
+    "🏫 Educación":          '[amenity~"school|university|college|library"]',
+    "🚇 Transporte":         '[amenity~"bus_station|taxi"][public_transport~"station|stop_area"]',
+    "💪 Gimnasios":          '[leisure~"fitness_centre|sports_centre"]',
+    "🌳 Parques":            '[leisure="park"]',
+    "🏦 Bancos/ATM":         '[amenity~"bank|atm"]',
+}
+
+POI_COLORS = {
+    "🍽️ Restaurantes":    "#f97316",
+    "🛒 Supermercados":   "#a78bfa",
+    "🏬 Centro comercial": "#fb923c",
+    "🏥 Salud":           "#f87171",
+    "🏫 Educación":       "#60a5fa",
+    "🚇 Transporte":      "#facc15",
+    "💪 Gimnasios":       "#4ade80",
+    "🌳 Parques":         "#86efac",
+    "🏦 Bancos/ATM":      "#94a3b8",
+}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_pois(lat: float, lon: float, radius_m: int = 800) -> dict[str, pd.DataFrame]:
+    """
+    Query Overpass API for POIs around a coordinate.
+    Returns dict of category → DataFrame(name, lat, lon).
+    Falls back to empty dicts on any network error.
+    """
+    results = {}
+    for cat, tag_filter in POI_CATEGORIES.items():
+        query = f"""
+        [out:json][timeout:10];
+        node{tag_filter}(around:{radius_m},{lat},{lon});
+        out body;
+        """
+        try:
+            r = _requests.post(
+                "https://overpass-api.de/api/interpreter",
+                data={"data": query},
+                timeout=12,
+            )
+            elements = r.json().get("elements", [])
+            rows = []
+            for e in elements:
+                if "lat" not in e or "lon" not in e:
+                    continue
+                tags = e.get("tags", {})
+                name = tags.get("name", cat.split()[-1])
+                row = {"name": name, "lat": e["lat"], "lon": e["lon"]}
+                # OSM rating fields (present on well-mapped venues)
+                rating = tags.get("stars") or tags.get(
+                    "rating") or tags.get("opening_hours:rating")
+                if rating:
+                    try:
+                        row["rating"] = float(
+                            str(rating).replace(",", ".").strip())
+                    except ValueError:
+                        row["rating"] = None
+                else:
+                    row["rating"] = None
+                # Extra context
+                row["cuisine"] = tags.get("cuisine", "")
+                row["opening"] = tags.get("opening_hours", "")
+                rows.append(row)
+            if rows:
+                results[cat] = pd.DataFrame(rows)
+        except Exception:
+            pass
+    return results
+
+
+# ─────────────────────────────────────────────
 # Sidebar
 # ─────────────────────────────────────────────
 with st.sidebar:
@@ -448,6 +583,20 @@ with st.sidebar:
     max_price = st.number_input(
         "Precio máximo (COP)", value=2_000_000_000, step=1_000_000, format="%d")
 
+    st.markdown("---")
+    st.markdown("<div class='section-header'>Estado del modelo</div>",
+                unsafe_allow_html=True)
+    st.markdown(
+        f"""<div style='font-size:12px;color:#5f8ab0;line-height:2;'>
+            📅 <b style='color:#8aabcc'>Datos actualizados</b><br>
+            <span style='font-family:"DM Mono",monospace;color:#0fd4c0'>{DATA_DATE}</span><br><br>
+            📐 <b style='color:#8aabcc'>R² Arriendo</b><br>
+            <span style='font-family:"DM Mono",monospace;color:#0fd4c0'>{MODEL_R2.get("arr", float("nan")):.4f}</span><br><br>
+            📐 <b style='color:#8aabcc'>R² Venta</b><br>
+            <span style='font-family:"DM Mono",monospace;color:#0fd4c0'>{MODEL_R2.get("ven", float("nan")):.4f}</span>
+        </div>""",
+        unsafe_allow_html=True,
+    )
     st.markdown("---")
     st.caption("Por Roman Alejandro Correa")
 
@@ -748,74 +897,15 @@ elif mode == "🗺️ Mapa de oportunidades":
         "Ver", ["Venta", "Arriendo"], default="Venta")
     df_map = sales if map_mode == "Venta" else loan
 
-    # ── Choropleth ──
-    summary = (
-        df_map.groupby("barrio_norm")
-        .agg(
-            count=("precio", "count"),
-            median_price=("precio", "median"),
-            pct_opp=("oportunity_houses", "mean"),
-        )
-        .reset_index()
-    )
-    summary["pct_opp"] *= 100
-
-    gdf_work = gdf.copy()
-    # Try to find the neighbourhood name column
-    name_col = next(
-        (c for c in ["nombre", "name", "NOMBRE"] if c in gdf_work.columns), None)
-    if name_col:
-        gdf_work["barrio_norm"] = gdf_work[name_col].astype(
-            str).str.strip().str.lower()
-    else:
-        gdf_work["barrio_norm"] = ""
-
-    merged = gdf_work.merge(summary, on="barrio_norm", how="left")
-    merged[["pct_opp", "count", "median_price"]] = merged[[
-        "pct_opp", "count", "median_price"]].fillna(0)
-
-    fig_choro = px.choropleth_mapbox(
-        merged,
-        geojson=merged.geometry.__geo_interface__,
-        locations=merged.index,
-        color="pct_opp",
-        color_continuous_scale="teal",
-        range_color=(0, 60),
-        mapbox_style="carto-darkmatter",
-        center=dict(lat=merged.geometry.centroid.y.mean(),
-                    lon=merged.geometry.centroid.x.mean()),
-        zoom=10.5,
-        opacity=0.7,
-        hover_data={"barrio_norm": True, "count": True,
-                    "median_price": True, "pct_opp": ":.1f"},
-        labels={"pct_opp": "% oportunidades",
-                "median_price": "Precio mediana", "count": "Listings"},
-        title=f"% de propiedades subvaloradas por barrio — {map_mode}",
-    )
-    fig_choro.update_layout(
-        margin={"r": 0, "t": 40, "l": 0, "b": 0},
-        paper_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="DM Sans", color="#8aabcc"),
-        height=480,
-        coloraxis_colorbar=dict(title="% oport."),
-    )
-    st.plotly_chart(fig_choro, use_container_width=True)
-
-    # ── Opportunity table ──
-    st.markdown("<div class='section-header'>Propiedades oportunidad (>20% subvaloradas)</div>",
-                unsafe_allow_html=True)
-
+    # ── Prepare data ─────────────────────────────────────────────────────────
     opp = df_map[df_map["oportunity_houses"]].copy()
     if selected_barrio != "Todos":
         opp = opp[opp["barrio_norm"] == selected_barrio.strip().lower()]
     opp = opp[(opp["precio"] >= min_price) & (opp["precio"] <= max_price)]
-
-    st.markdown(
-        f"**{len(opp):,}** propiedades encontradas con descuento potencial > 20%")
+    opp_with_coords = opp.reset_index(drop=True)
 
     show_cols = [c for c in ["nombre", "tipo", "precio", "cat_pred", "pct_underpriced",
                              "area", "habitaciones", "baños", "parqueaderos", "url"] if c in opp.columns]
-
     opp_display = opp[show_cols].copy()
     if "precio" in opp_display.columns:
         opp_display["precio"] = opp_display["precio"].apply(fmt_price)
@@ -824,25 +914,215 @@ elif mode == "🗺️ Mapa de oportunidades":
     if "pct_underpriced" in opp_display.columns:
         opp_display["pct_underpriced"] = opp_display["pct_underpriced"].apply(
             lambda x: f"{x:.1f}%")
-
     opp_display = opp_display.rename(columns={
         "nombre": "Barrio", "tipo": "Tipo", "precio": "Precio real",
         "cat_pred": "Precio modelo", "pct_underpriced": "Descuento",
         "area": "m²", "habitaciones": "Hab", "baños": "Baños",
         "parqueaderos": "Parq", "url": "Link",
     })
-
-    # Build column_config — add clickable link if url column exists
+    if "Tipo" in opp_display.columns:
+        opp_display["Tipo"] = opp_display["Tipo"].str.title()
     col_cfg = {}
     if "Link" in opp_display.columns:
         col_cfg["Link"] = st.column_config.LinkColumn(
-            "Link",
-            display_text="Ver →",
-            help="Abrir listado en metrocuadrado.com",
+            "Link", display_text="Ver →", help="Abrir en metrocuadrado.com")
+
+    has_coords = "latitud" in opp_with_coords.columns and "longitud" in opp_with_coords.columns
+
+    # ── Neighbourhood filter (scoped to this page, above the columns) ──────────
+    opp_barrios = ["Todos"] + \
+        sorted(opp_with_coords["nombre"].dropna().unique().tolist())
+    fc1, fc2 = st.columns([1, 3])
+    with fc1:
+        page_barrio = st.selectbox(
+            "Filtrar por barrio",
+            opp_barrios,
+            key="page_barrio_filter",
+        )
+    if page_barrio != "Todos":
+        mask = opp_with_coords["nombre"].str.strip(
+        ).str.lower() == page_barrio.strip().lower()
+        opp_with_coords = opp_with_coords[mask].reset_index(drop=True)
+        opp_display = opp_display[mask.values].reset_index(drop=True)
+
+    # ── Side-by-side: table left, map right ───────────────────────────────────
+    col_tbl, col_map = st.columns([1, 1], gap="medium")
+
+    with col_tbl:
+        st.markdown(
+            f"<div class='section-header'>Propiedades oportunidad "
+            f"<span style='color:#0fd4c0'>{len(opp):,}</span> encontradas</div>",
+            unsafe_allow_html=True,
+        )
+        selected_event = st.dataframe(
+            opp_display,
+            use_container_width=True,
+            height=460,
+            hide_index=True,
+            column_config=col_cfg,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="opp_table",
         )
 
-    st.dataframe(opp_display, use_container_width=True, height=380,
-                 hide_index=True, column_config=col_cfg)
+        # ── POI controls live under the table, not above the map ─────────────
+        selected_rows = selected_event.selection.get(
+            "rows", []) if selected_event else []
+        sel_lat = sel_lon = None
+        prop = None
+        if selected_rows and has_coords:
+            prop = opp_with_coords.iloc[selected_rows[0]]
+            _lat = prop.get("latitud")
+            _lon = prop.get("longitud")
+            if pd.notna(_lat) and pd.notna(_lon):
+                sel_lat, sel_lon = _lat, _lon
+
+        if sel_lat:
+            st.markdown("<div class='section-header'>Puntos de interés cercanos</div>",
+                        unsafe_allow_html=True)
+            poi_toggle = st.toggle("Mostrar en el mapa",
+                                   value=True, key="poi_toggle")
+            poi_cats = st.multiselect(
+                "Categorías",
+                options=list(POI_CATEGORIES.keys()),
+                default=["🍽️ Restaurantes", "🛒 Supermercados",
+                         "🌳 Parques", "🚇 Transporte"],
+                key="poi_cats",
+                label_visibility="collapsed",
+            )
+        else:
+            poi_toggle = False
+            poi_cats = []
+
+        # Fetch POIs here so the result is available inside col_map
+        pois = {}
+        if sel_lat and poi_toggle and poi_cats:
+            with st.spinner("Buscando puntos de interés..."):
+                pois = fetch_pois(sel_lat, sel_lon, radius_m=800)
+
+    with col_map:
+        # ── Build map — no widgets here, purely the figure ────────────────────
+        if not has_coords:
+            st.caption("Sin coordenadas disponibles.")
+        else:
+            map_base = opp_with_coords.dropna(
+                subset=["latitud", "longitud"]).copy()
+            map_base["label"] = (
+                map_base["nombre"].astype(str).str.title() + " · " +
+                map_base["precio"].apply(fmt_price) + " · " +
+                map_base["pct_underpriced"].apply(lambda x: f"{x:.1f}% desc")
+            )
+
+            if sel_lat:
+                center_lat, center_lon, zoom = sel_lat, sel_lon, 15
+            else:
+                center_lat = map_base["latitud"].mean()
+                center_lon = map_base["longitud"].mean()
+                zoom = 12
+
+            fig_map = go.Figure()
+
+            # Background opportunity dots
+            bg = map_base if sel_lat is None else map_base[
+                ~((map_base["latitud"] == sel_lat) &
+                  (map_base["longitud"] == sel_lon))
+            ]
+            if len(bg):
+                fig_map.add_trace(go.Scattermapbox(
+                    lat=bg["latitud"], lon=bg["longitud"],
+                    mode="markers",
+                    marker=dict(size=7, color="#1a7a6e", opacity=0.7),
+                    text=bg["label"], hoverinfo="text",
+                    name="Oportunidades",
+                ))
+
+            # Selected property — bright + label
+            if sel_lat:
+                sel_label = (
+                    f"{prop.get('tipo', '').title()} · "
+                    f"{fmt_price(prop.get('precio'))} · "
+                    f"{prop.get('nombre', '')} · "
+                    f"{prop.get('pct_underpriced', 0):.1f}% desc"
+                )
+                fig_map.add_trace(go.Scattermapbox(
+                    lat=[sel_lat], lon=[sel_lon],
+                    mode="markers+text",
+                    marker=dict(size=20, color="#0fd4c0", opacity=1.0),
+                    text=[prop.get("nombre", "").title()],
+                    textposition="top center",
+                    textfont=dict(size=12, color="#0fd4c0"),
+                    hovertext=[sel_label], hoverinfo="text",
+                    name="Seleccionada",
+                ))
+
+                # POI traces — data already fetched in col_tbl
+                for cat in poi_cats:
+                    if cat in pois and len(pois[cat]):
+                        df_poi = pois[cat]
+                        df_poi = pois[cat].copy()
+                        # Build rich hover: name + rating stars + cuisine
+
+                        def _poi_label(row):
+                            parts = [row["name"]]
+                            if pd.notna(row.get("rating")) and row.get("rating"):
+                                stars = "★" * \
+                                    int(round(row["rating"])) + "☆" * \
+                                    (5 - int(round(row["rating"])))
+                                parts.append(f"{stars} ({row['rating']:.1f})")
+                            if row.get("cuisine"):
+                                parts.append(
+                                    row["cuisine"].replace(";", ", ").title())
+                            if row.get("opening"):
+                                parts.append(f"🕐 {row['opening'][:30]}")
+                            return "<br>".join(parts)
+                        df_poi["hover"] = df_poi.apply(_poi_label, axis=1)
+                        # Size by rating if available, else uniform
+                        has_rating = df_poi["rating"].notna() & (
+                            df_poi["rating"] > 0)
+                        sizes = (df_poi["rating"].fillna(3) /
+                                 5 * 10 + 6).clip(6, 16).tolist()
+                        fig_map.add_trace(go.Scattermapbox(
+                            lat=df_poi["lat"], lon=df_poi["lon"],
+                            mode="markers",
+                            marker=dict(
+                                size=sizes,
+                                color=POI_COLORS.get(cat, "#ffffff"),
+                                opacity=0.9,
+                            ),
+                            text=df_poi["hover"], hoverinfo="text",
+                            name=cat,
+                        ))
+
+            fig_map.update_layout(
+                mapbox=dict(
+                    style="carto-darkmatter",
+                    center=dict(lat=center_lat, lon=center_lon),
+                    zoom=zoom,
+                ),
+                margin={"r": 0, "t": 0, "l": 0, "b": 0},
+                paper_bgcolor="rgba(0,0,0,0)",
+                height=560,
+                legend=dict(
+                    bgcolor="rgba(10,15,26,0.85)",
+                    bordercolor="#1e3a5f",
+                    borderwidth=1,
+                    font=dict(color="#8aabcc", size=11),
+                    x=0.01, y=0.99,
+                ),
+                showlegend=sel_lat is not None,
+            )
+
+            if sel_lat:
+                st.caption(
+                    f"📍 **{prop.get('tipo', '').title()} · "
+                    f"{fmt_price(prop.get('precio'))} · "
+                    f"{prop.get('nombre', '')}** — "
+                    f"{prop.get('pct_underpriced', 0):.1f}% bajo modelo"
+                )
+            else:
+                st.caption(
+                    "Selecciona una fila para ver la propiedad y sus POIs.")
+            st.plotly_chart(fig_map, use_container_width=True)
 
     # ── Scatter: real vs predicted ──
     st.markdown("<div class='section-header'>Precio real vs. precio estimado por el modelo</div>",
@@ -861,7 +1141,6 @@ elif mode == "🗺️ Mapa de oportunidades":
         title="Precio real vs estimado — teal = oportunidad",
         opacity=0.7,
     )
-    # diagonal reference line
     max_val = scatter_df[["precio", "cat_pred"]].max().max()
     fig_sc.add_trace(go.Scatter(
         x=[0, max_val], y=[0, max_val],
