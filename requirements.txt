@@ -1,9 +1,12 @@
+# Pinned to exact versions used to train and pickle the models.
+# Do NOT upgrade these without retraining and re-pickling.
+
 # ── Core data & ML ───────────────────────────────────────────────
-numpy>=1.26,<3
-pandas>=2.1,<4
-scikit-learn>=1.4,<2
-xgboost>=2.0,<3
-scikit-optimize>=0.10,<1        # BayesSearchCV
+numpy==2.3.2
+pandas==2.3.1
+scikit-learn==1.6.1
+xgboost==3.0.3
+scikit-optimize==0.10.2
 
 # ── Geospatial ────────────────────────────────────────────────────
 geopandas>=0.14,<2

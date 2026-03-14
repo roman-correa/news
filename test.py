@@ -1,0 +1,10 @@
+import xgboost
+import sklearn
+import skopt
+import pandas
+import numpy
+print('xgboost:', xgboost.__version__)
+print('sklearn:', sklearn.__version__)
+print('skopt:', skopt.__version__)
+print('pandas:', pandas.__version__)
+print('numpy:', numpy.__version__)
