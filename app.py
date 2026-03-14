@@ -185,9 +185,15 @@ html, body, [class*="css"] {
 # ─────────────────────────────────────────────
 # Cached loaders
 # ─────────────────────────────────────────────
-@st.cache_data(ttl=3600)
 def load_pickle(path: str):
-    with open(path, "rb") as f:
+    """Load a pickle file with a clear error if the file is missing or corrupt."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"Artifact not found: {path}\n"
+            f"Run train.py to generate artifacts, then commit the artifacts/ folder."
+        )
+    with open(p, "rb") as f:
         return pickle.load(f)
 
 
@@ -203,34 +209,39 @@ def load_geojson(path: str):
 
 # ─────────────────────────────────────────────
 # Load artifacts
-# train.py saves two preprocessors (arr + ven).
-# Legacy flat layout has one shared preprocessor.pkl — we fall back to it
-# for both if the split versions don't exist yet.
 # ─────────────────────────────────────────────
-arr_cats = load_pickle(_artifact("best_features_arr.pkl"))
-ven_cats = load_pickle(_artifact("best_features_ven.pkl"))
-xgb_arr = load_pickle(_artifact("xgb_model_arr_med.pkl"))
-xgb_ven = load_pickle(_artifact("xgb_model_ven_med.pkl"))
-list_barrios = load_pickle(_artifact("list_barrios.pkl"))
-ppmc_arr = load_pickle(_artifact("price_per_m2_arr.pkl"))
-ppmc_ven = load_pickle(_artifact("price_per_m2_ven.pkl"))
-pppz_arr = load_pickle(_artifact("price_per_space_arr.pkl"))
-pppz_ven = load_pickle(_artifact("price_per_space_ven.pkl"))
-pppp_arr = load_pickle(_artifact("price_per_parking_arr.pkl"))
-pppp_ven = load_pickle(_artifact("price_per_parking_ven.pkl"))
-barrio_te_arr = load_pickle(_artifact("barrio_te_arr.pkl"))
-barrio_te_ven = load_pickle(_artifact("barrio_te_ven.pkl"))
+try:
+    arr_cats = load_pickle(_artifact("best_features_arr.pkl"))
+    ven_cats = load_pickle(_artifact("best_features_ven.pkl"))
+    xgb_arr = load_pickle(_artifact("xgb_model_arr_med.pkl"))
+    xgb_ven = load_pickle(_artifact("xgb_model_ven_med.pkl"))
+    list_barrios = load_pickle(_artifact("list_barrios.pkl"))
+    ppmc_arr = load_pickle(_artifact("price_per_m2_arr.pkl"))
+    ppmc_ven = load_pickle(_artifact("price_per_m2_ven.pkl"))
+    pppz_arr = load_pickle(_artifact("price_per_space_arr.pkl"))
+    pppz_ven = load_pickle(_artifact("price_per_space_ven.pkl"))
+    pppp_arr = load_pickle(_artifact("price_per_parking_arr.pkl"))
+    pppp_ven = load_pickle(_artifact("price_per_parking_ven.pkl"))
+    barrio_te_arr = load_pickle(_artifact("barrio_te_arr.pkl"))
+    barrio_te_ven = load_pickle(_artifact("barrio_te_ven.pkl"))
 
-# Preprocessor: prefer split versions, fall back to legacy single file
-_pp_arr_path = _artifact("preprocessor_arr.pkl")
-_pp_ven_path = _artifact("preprocessor_ven.pkl")
-_pp_legacy = _artifact("preprocessor.pkl")
-preprocessor_arr = load_pickle(_pp_arr_path if Path(
-    _pp_arr_path).exists() else _pp_legacy)
-preprocessor_ven = load_pickle(_pp_ven_path if Path(
-    _pp_ven_path).exists() else _pp_legacy)
+    # Preprocessor: prefer split versions, fall back to legacy single file
+    _pp_arr_path = _artifact("preprocessor_arr.pkl")
+    _pp_ven_path = _artifact("preprocessor_ven.pkl")
+    _pp_legacy = _artifact("preprocessor.pkl")
+    preprocessor_arr = load_pickle(_pp_arr_path if Path(
+        _pp_arr_path).exists() else _pp_legacy)
+    preprocessor_ven = load_pickle(_pp_ven_path if Path(
+        _pp_ven_path).exists() else _pp_legacy)
 
-# cat_model_arr_med.pkl is a legacy artifact — new pipeline uses xgb_arr for everything
+except Exception as _e:
+    import traceback
+    st.error(
+        f"**Error loading model artifacts.**\n\n"
+        f"`{type(_e).__name__}: {_e}`\n\n"
+        f"```\n{traceback.format_exc()}\n```"
+    )
+    st.stop()
 
 loan = load_csv(_artifact("arr_mede_final.csv"))
 sales = load_csv(_artifact("ven_mede_final.csv"))
