@@ -2,6 +2,11 @@
 Compra/Venta Medellín — Real Estate Price Predictor
 Author: Roman Alejandro Correa
 """
+from sklearn.model_selection import KFold
+from catboost import CatBoostRegressor
+from lightgbm import LGBMRegressor
+from xgboost import XGBRegressor
+from sklearn.linear_model import Ridge
 import streamlit as st
 import pandas as pd
 import geopandas as gpd
@@ -180,6 +185,29 @@ html, body, [class*="css"] {
 #MainMenu, footer, header { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
+# StackedEnsemble — must be defined here so pickle can deserialise it
+# (pickle looks up the class in the module where it's being loaded)
+# ─────────────────────────────────────────────
+
+
+class StackedEnsemble:
+    """XGBoost + LightGBM + CatBoost → Ridge meta-learner."""
+
+    def __init__(self, xgb_p=None, lgb_p=None, cat_p=None):
+        self.xgb_p = xgb_p or {}
+        self.lgb_p = lgb_p or {}
+        self.cat_p = cat_p or {}
+        self.base_ = []
+        self.meta_ = None
+
+    def predict(self, X) -> np.ndarray:
+        X = X.replace([np.inf, -np.inf], np.nan).fillna(X.median())
+        return self.meta_.predict(
+            np.column_stack([m.predict(X) for m in self.base_])
+        )
 
 
 # ─────────────────────────────────────────────
