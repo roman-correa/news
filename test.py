@@ -1,5 +1,16 @@
-import lightgbm; print('lightgbm OK', lightgbm.__version__)
-import catboost; print('catboost OK', catboost.__version__)
-import optuna; print('optuna OK', optuna.__version__)
-import mlflow; print('mlflow OK', mlflow.__version__)
-import geopy; print('geopy OK', geopy.__version__)
+import sklearn
+import xgboost
+import lightgbm
+import catboost
+import numpy
+import pandas
+import geopandas
+import streamlit
+import plotly
+import optuna
+import mlflow
+import geopy
+import requests
+import rapidfuzz
+for m in [sklearn, xgboost, lightgbm, catboost, numpy, pandas, geopandas, streamlit, plotly, optuna, mlflow, geopy, requests, rapidfuzz]:
+    print(f'{m.__name__}: {m.__version__}')
