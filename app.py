@@ -213,8 +213,6 @@ def load_geojson(path: str):
 try:
     arr_cats = load_pickle(_artifact("best_features_arr.pkl"))
     ven_cats = load_pickle(_artifact("best_features_ven.pkl"))
-    xgb_arr = load_pickle(_artifact("xgb_model_arr_med.pkl"))
-    xgb_ven = load_pickle(_artifact("xgb_model_ven_med.pkl"))
     list_barrios = load_pickle(_artifact("list_barrios.pkl"))
     ppmc_arr = load_pickle(_artifact("price_per_m2_arr.pkl"))
     ppmc_ven = load_pickle(_artifact("price_per_m2_ven.pkl"))
@@ -225,7 +223,6 @@ try:
     barrio_te_arr = load_pickle(_artifact("barrio_te_arr.pkl"))
     barrio_te_ven = load_pickle(_artifact("barrio_te_ven.pkl"))
 
-    # Preprocessor: prefer split versions, fall back to legacy single file
     _pp_arr_path = _artifact("preprocessor_arr.pkl")
     _pp_ven_path = _artifact("preprocessor_ven.pkl")
     _pp_legacy = _artifact("preprocessor.pkl")
@@ -234,7 +231,37 @@ try:
     preprocessor_ven = load_pickle(_pp_ven_path if Path(
         _pp_ven_path).exists() else _pp_legacy)
 
+    # Main model — prefer stacked ensemble, fall back to XGBoost
+    _has_stack = Path(_artifact("stack_arr.pkl")).exists()
+    if _has_stack:
+        model_arr = load_pickle(_artifact("stack_arr.pkl"))
+        model_ven = load_pickle(_artifact("stack_ven.pkl"))
+    else:
+        model_arr = load_pickle(_artifact("xgb_model_arr_med.pkl"))
+        model_ven = load_pickle(_artifact("xgb_model_ven_med.pkl"))
+
+    # Quantile models — prefer real, fall back to ±12% heuristic
+    _has_quantile = Path(_artifact("q10_arr.pkl")).exists()
+    if _has_quantile:
+        q10_arr = load_pickle(_artifact("q10_arr.pkl"))
+        q90_arr = load_pickle(_artifact("q90_arr.pkl"))
+        q10_ven = load_pickle(_artifact("q10_ven.pkl"))
+        q90_ven = load_pickle(_artifact("q90_ven.pkl"))
+    else:
+        q10_arr = q90_arr = q10_ven = q90_ven = None
+
+    # Saved R² from train.py
+    _r2_path = _artifact("model_r2.pkl")
+    _saved_r2 = load_pickle(_r2_path) if Path(_r2_path).exists() else None
+
 except Exception as _e:
+    _saved_r2 = None
+    _has_stack = False
+    _has_quantile = False
+    model_arr = model_ven = None
+    q10_arr = q90_arr = q10_ven = q90_ven = None
+    arr_cats = ven_cats = []
+    preprocessor_arr = preprocessor_ven = None
     import traceback
     st.error(
         f"**Error loading model artifacts.**\n\n"
@@ -253,6 +280,7 @@ gdf = load_geojson("medellin.geojson")
 NUM_ATTRIBS = [
     "area", "habitaciones", "baños", "parqueaderos", "espacios",
     "axe", "axh", "axa", "parq2", "garaje_bin",
+    "estrato", "administracion", "dist_metro_km",
     "ppmc", "pppz", "pppp", "new_index",
     "pppp/pppz", "pppp/ppmc", "pppz/ppmc",
     "barrio_count",
@@ -260,31 +288,37 @@ NUM_ATTRIBS = [
 ]
 CAT_ATTRIBS = ["tipo"]
 
-
-@st.cache_data(ttl=3600)
-def compute_r2() -> dict[str, float]:
-    """Compute R² live from loaded models — always reflects the latest retrain."""
-    from sklearn.metrics import r2_score
-    results = {}
-    for kind, df, pp, model, cats in [
-        ("arr", loan,  preprocessor_arr, xgb_arr, arr_cats),
-        ("ven", sales, preprocessor_ven, xgb_ven, ven_cats),
-    ]:
-        try:
-            X = pd.DataFrame(
-                pp.transform(df[NUM_ATTRIBS + CAT_ATTRIBS]),
-                columns=pp.get_feature_names_out(),
-            )
-            available = [c for c in cats if c in X.columns]
-            preds = model.predict(X[available])
-            results[kind] = round(
-                float(r2_score(np.log1p(df["precio"]), preds)), 4)
-        except Exception:
-            results[kind] = float("nan")
-    return results
-
-
-MODEL_R2 = compute_r2()
+if _saved_r2:
+    MODEL_R2 = _saved_r2
+else:
+    @st.cache_data(ttl=3600)
+    def _compute_r2() -> dict[str, float]:
+        from sklearn.metrics import r2_score
+        results = {}
+        for kind, df, pp, m, cats in [
+            ("arr", loan,  preprocessor_arr, model_arr, arr_cats),
+            ("ven", sales, preprocessor_ven, model_ven, ven_cats),
+        ]:
+            try:
+                if pp is None or m is None:
+                    results[kind] = float("nan")
+                    continue
+                # Only use columns the preprocessor actually knows about
+                pp_cols = [c for c in NUM_ATTRIBS +
+                           CAT_ATTRIBS if c in df.columns]
+                X = pd.DataFrame(pp.transform(df[pp_cols]),
+                                 columns=pp.get_feature_names_out())
+                avail = [c for c in cats if c in X.columns]
+                if not avail:
+                    results[kind] = float("nan")
+                    continue
+                preds = m.predict(X[avail])
+                results[kind] = round(
+                    float(r2_score(np.log1p(df["precio"]), preds)), 4)
+            except Exception:
+                results[kind] = float("nan")
+        return results
+    MODEL_R2 = _compute_r2()
 
 
 def _data_date() -> str:
@@ -328,29 +362,36 @@ def _add_derived_features(df: pd.DataFrame, te_map: pd.Series) -> pd.DataFrame:
 @st.cache_data(ttl=3600)
 def add_opportunity_labels(_loan, _sales):
     """Return loan and sales DataFrames with opportunity columns added."""
-    loan_c = _add_derived_features(_loan.copy(),  barrio_te_arr)
-    sales_c = _add_derived_features(_sales.copy(), barrio_te_ven)
+    loan_c = _loan.copy()
+    sales_c = _sales.copy()
 
-    # Arriendo
-    loan_std = preprocessor_arr.transform(loan_c[NUM_ATTRIBS + CAT_ATTRIBS])
-    loan_std = pd.DataFrame(
-        loan_std, columns=preprocessor_arr.get_feature_names_out())
-    loan_c["cat_pred"] = np.expm1(xgb_arr.predict(loan_std[arr_cats]))
-    loan_c["is_underpriced"] = loan_c["precio"] < loan_c["cat_pred"]
-    loan_c["pct_underpriced"] = (
-        loan_c["cat_pred"] - loan_c["precio"]) / loan_c["cat_pred"] * 100
-    loan_c["oportunity_houses"] = loan_c["pct_underpriced"] > 20
+    # Guard: if models or preprocessors aren't loaded, skip silently
+    if preprocessor_arr is None or preprocessor_ven is None or model_arr is None or model_ven is None:
+        for df in [loan_c, sales_c]:
+            df["cat_pred"] = np.nan
+            df["is_underpriced"] = False
+            df["pct_underpriced"] = 0.0
+            df["oportunity_houses"] = False
+        return loan_c, sales_c
 
-    # Venta
-    sales_std = preprocessor_ven.transform(sales_c[NUM_ATTRIBS + CAT_ATTRIBS])
-    sales_std = pd.DataFrame(
-        sales_std, columns=preprocessor_ven.get_feature_names_out())
-    sales_c["cat_pred"] = np.expm1(xgb_ven.predict(sales_std[ven_cats]))
-    sales_c["is_underpriced"] = sales_c["precio"] < sales_c["cat_pred"]
-    sales_c["pct_underpriced"] = (
-        sales_c["cat_pred"] - sales_c["precio"]) / sales_c["cat_pred"] * 100
-    sales_c["oportunity_houses"] = sales_c["pct_underpriced"] > 20
+    loan_c = _add_derived_features(loan_c,  barrio_te_arr)
+    sales_c = _add_derived_features(sales_c, barrio_te_ven)
 
+    def _opp(df, pp, model, cats):
+        # Only pass columns the preprocessor was trained on
+        pp_cols = [c for c in NUM_ATTRIBS + CAT_ATTRIBS if c in df.columns]
+        std = pd.DataFrame(pp.transform(
+            df[pp_cols]), columns=pp.get_feature_names_out())
+        avail = [c for c in cats if c in std.columns]
+        df["cat_pred"] = np.expm1(model.predict(std[avail]))
+        df["is_underpriced"] = df["precio"] < df["cat_pred"]
+        df["pct_underpriced"] = (
+            df["cat_pred"] - df["precio"]) / df["cat_pred"] * 100
+        df["oportunity_houses"] = df["pct_underpriced"] > 20
+        return df
+
+    loan_c = _opp(loan_c,  preprocessor_arr, model_arr, arr_cats)
+    sales_c = _opp(sales_c, preprocessor_ven, model_ven, ven_cats)
     return loan_c, sales_c
 
 
@@ -360,7 +401,9 @@ loan, sales = add_opportunity_labels(loan, sales)
 # ─────────────────────────────────────────────
 # Feature engineering helper
 # ─────────────────────────────────────────────
-def _build_input_df(area, habitaciones, banos, parqueaderos, barrio, tipo, kind="arr") -> pd.DataFrame:
+def _build_input_df(area, habitaciones, banos, parqueaderos, barrio, tipo, kind="arr",
+                    estrato: float = 3.0, administracion: float = 0.0,
+                    dist_metro_km: float = 1.0) -> pd.DataFrame:
     """
     Return a single-row DataFrame with exactly NUM_ATTRIBS + CAT_ATTRIBS columns
     so it can be passed directly to preprocessor.transform().
@@ -408,6 +451,9 @@ def _build_input_df(area, habitaciones, banos, parqueaderos, barrio, tipo, kind=
         "axa":               axa,
         "parq2":             parq2,
         "garaje_bin":        1 if parqueaderos > 0 else 0,
+        "estrato":           estrato,
+        "administracion":    administracion,
+        "dist_metro_km":     dist_metro_km,
         "ppmc":              barrio_ppmc,
         "pppz":              barrio_pppz,
         "pppp":              barrio_pppp,
@@ -415,8 +461,8 @@ def _build_input_df(area, habitaciones, banos, parqueaderos, barrio, tipo, kind=
         "pppp/pppz":         safe_ratio(barrio_pppp, barrio_pppz),
         "pppp/ppmc":         safe_ratio(barrio_pppp, barrio_ppmc),
         "pppz/ppmc":         safe_ratio(barrio_pppz, barrio_ppmc),
-        "barrio_count":  float(barrio_count),
-        "barrio_te":     barrio_te,
+        "barrio_count":      float(barrio_count),
+        "barrio_te":         barrio_te,
         "tipo":              tipo,
     }
     return pd.DataFrame([row])
@@ -435,20 +481,24 @@ def _validate(barrio, tipo, reference_df) -> str | None:
     return None
 
 
-def predict(area, habitaciones, banos, parqueaderos, barrio, tipo, kind="arr") -> tuple[float | None, float | None, str | None]:
+def predict(area, habitaciones, banos, parqueaderos, barrio, tipo, kind="arr", **kwargs) -> tuple[float | None, float | None, float | None, float | None, str | None]:
     """Return (prediction, price_per_m2, error_string)."""
     ref_df = loan if kind == "arr" else sales
     err = _validate(barrio, tipo, ref_df)
     if err:
         return None, None, err
 
-    input_df = _build_input_df(
-        area, habitaciones, banos, parqueaderos, barrio, tipo, kind)
+    input_df = _build_input_df(area, habitaciones, banos, parqueaderos, barrio, tipo, kind,
+                               estrato=kwargs.get("estrato", 3.0),
+                               administracion=kwargs.get(
+                                   "administracion", 0.0),
+                               dist_metro_km=kwargs.get("dist_metro_km", 1.0))
 
-    # Use the correct preprocessor for each transaction type
     pp = preprocessor_arr if kind == "arr" else preprocessor_ven
     cats = arr_cats if kind == "arr" else ven_cats
-    model = xgb_arr if kind == "arr" else xgb_ven
+    model = model_arr if kind == "arr" else model_ven
+    q10 = (q10_arr if kind == "arr" else q10_ven) if _has_quantile else None
+    q90 = (q90_arr if kind == "arr" else q90_ven) if _has_quantile else None
 
     X = pp.transform(input_df[NUM_ATTRIBS + CAT_ATTRIBS])
     if hasattr(X, "toarray"):
@@ -457,12 +507,18 @@ def predict(area, habitaciones, banos, parqueaderos, barrio, tipo, kind="arr") -
 
     missing = [c for c in cats if c not in X.columns]
     if missing:
-        return None, None, f"Faltan columnas: {missing}"
+        return None, None, None, None, f"Faltan columnas: {missing}"
 
-    raw_pred = model.predict(X[cats])
-    price = float(np.expm1(raw_pred)[0])
+    price = float(np.expm1(model.predict(X[cats]))[0])
     ppm2 = price / area if area else None
-    return price, ppm2, None
+
+    if q10 is not None:
+        low = float(np.expm1(q10.predict(X[cats]))[0])
+        high = float(np.expm1(q90.predict(X[cats]))[0])
+    else:
+        low, high = price * 0.88, price * 1.12
+
+    return price, ppm2, low, high, None
 
 
 # ─────────────────────────────────────────────
@@ -657,6 +713,15 @@ if mode == "🔮 Predictor":
             banos = st.number_input("Baños", 0, 10, 2)
         with col_b:
             parqueaderos = st.number_input("Parqueaderos", 0, 5, 1)
+            estrato_input = st.number_input("Estrato", 1, 6, 3)
+
+        col_c, col_d = st.columns(2)
+        with col_c:
+            admin_input = st.number_input(
+                "Admon. mensual (COP)", 0, 2_000_000, 0, step=50_000)
+        with col_d:
+            metro_input = st.number_input(
+                "Dist. metro aprox. (km)", 0.0, 10.0, 1.0, step=0.1)
 
         predict_btn = st.button("Predecir precio →",
                                 type="primary", use_container_width=True)
@@ -667,15 +732,12 @@ if mode == "🔮 Predictor":
 
         if predict_btn:
             with st.spinner("Calculando..."):
-                price, ppm2, err = predict(
-                    area, habitaciones, banos, parqueaderos, barrio, tipo, kind)
+                price, ppm2, low, high, err = predict(area, habitaciones, banos, parqueaderos, barrio, tipo, kind,
+                                                      estrato=estrato_input, administracion=admin_input, dist_metro_km=metro_input)
 
             if err:
                 st.error(err)
             else:
-                # Confidence range: ±12% (heuristic based on typical XGBoost RE RMSE)
-                low = price * 0.88
-                high = price * 1.12
 
                 st.markdown(f"""
                 <div class='pred-box'>

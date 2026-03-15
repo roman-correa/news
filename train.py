@@ -1,29 +1,34 @@
 """
-Medellín Real Estate — Training Pipeline
-=========================================
-Scrapes metrocuadrado.com, cleans data, engineers features,
-trains XGBoost models for arriendo and venta, and saves all
-artifacts needed by app.py.
+Medellín Real Estate — Training Pipeline  v2
+============================================
+Scrapes metrocuadrado.com + Fincaraíz, cleans data, engineers features
+(including estrato, metro distance, amenities), trains a stacked ensemble
+(XGBoost + LightGBM + CatBoost → Ridge meta-learner), produces quantile
+predictions for confidence intervals, and logs everything to MLflow.
 
 Usage:
-    python train.py                        # scrape + train both
-    python train.py --skip-scrape          # use existing CSVs
-    python train.py --mode arriendo        # train only arriendo
-    python train.py --mode venta           # train only venta
+    python train.py                          # scrape + train both
+    python train.py --skip-scrape            # use existing raw CSVs
+    python train.py --mode arriendo          # train arriendo only
+    python train.py --mode venta             # train venta only
+    python train.py --skip-scrape --fast     # 20 Optuna trials (dev)
 
-Outputs (all saved to ./artifacts/):
-    preprocessor_arr.pkl, preprocessor_ven.pkl
-    xgb_model_arr.pkl,    xgb_model_ven.pkl
-    best_features_arr.pkl, best_features_ven.pkl
-    price_per_m2_arr.pkl,  price_per_m2_ven.pkl
-    price_per_space_arr.pkl, price_per_space_ven.pkl
-    price_per_parking_arr.pkl, price_per_parking_ven.pkl
+Outputs  →  ./artifacts/
+    preprocessor_arr.pkl / preprocessor_ven.pkl
+    stack_arr.pkl        / stack_ven.pkl          (stacked ensemble)
+    q10_arr.pkl  q90_arr.pkl / q10_ven.pkl  q90_ven.pkl  (quantile models)
+    best_features_arr.pkl / best_features_ven.pkl
+    barrio_te_arr.pkl    / barrio_te_ven.pkl
+    price_per_m2_*.pkl   price_per_space_*.pkl   price_per_parking_*.pkl
+    metro_stations.pkl
     list_barrios.pkl
-    arr_mede_final.csv,   ven_mede_final.csv
+    model_r2.pkl
+    arr_mede_final.csv   / ven_mede_final.csv
 """
 
+from __future__ import annotations
+
 import argparse
-import os
 import pickle
 import time
 import unicodedata
@@ -31,177 +36,199 @@ import warnings
 from pathlib import Path
 
 import geopandas as gpd
+import mlflow
 import numpy as np
+import optuna
 import pandas as pd
 import requests
-from rapidfuzz import fuzz, process
+from geopy.distance import geodesic
+from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor
 from sklearn.compose import ColumnTransformer
+from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold, cross_val_score, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from xgboost import XGBRegressor
-from skopt import BayesSearchCV
-from skopt.space import Real, Integer
 
 warnings.filterwarnings("ignore")
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Config
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 ARTIFACTS_DIR = Path("artifacts")
 ARTIFACTS_DIR.mkdir(exist_ok=True)
 
-# Medellín bounding box (lat/lon) — filters out bad geocodes
 MEDELLIN_BOUNDS = dict(lat_min=6.175, lat_max=6.28,
                        lon_min=-75.62, lon_max=-75.55)
 
+# Metro de Medellín + Tranvía + Cables stations (name, lat, lon)
+METRO_STATIONS = [
+    ("Niquía",          6.338056, -75.536389),
+    ("Bello",           6.326667, -75.536944),
+    ("Madera",          6.315278, -75.540556),
+    ("Acevedo",         6.298889, -75.545278),
+    ("Tricentenario",   6.291111, -75.546944),
+    ("Caribe",          6.279167, -75.551389),
+    ("Universidad",     6.267778, -75.567222),
+    ("Hospital",        6.261389, -75.573333),
+    ("Prado",           6.257222, -75.572778),
+    ("Parque Berrío",   6.251389, -75.568611),
+    ("San Antonio",     6.247500, -75.569167),
+    ("Alpujarra",       6.245278, -75.572500),
+    ("Exposiciones",    6.241667, -75.573889),
+    ("Industriales",    6.236111, -75.574444),
+    ("Poblado",         6.210556, -75.574167),
+    ("Aguacatala",      6.199722, -75.573889),
+    ("Ayurá",           6.185556, -75.574722),
+    ("Envigado",        6.175278, -75.583889),
+    ("San Javier",      6.247222, -75.598333),
+    ("Floresta",        6.248056, -75.602222),
+    ("Santa Lucía",     6.248889, -75.609167),
+    ("El Pedregal",     6.249722, -75.614722),
+    ("La Mota",         6.250000, -75.620278),
+    ("Aranjuez",        6.281667, -75.555556),
+    ("Andalucía",       6.286944, -75.550278),
+    ("Villa Sierra",    6.294167, -75.543611),
+    ("Santo Domingo",   6.302222, -75.538889),
+]
+
 NUM_ATTRIBS = [
-    # Property size
+    # Core
     "area", "habitaciones", "baños", "parqueaderos", "espacios",
     # Area interactions
     "axe", "axh", "axa", "parq2", "garaje_bin",
-    # Neighbourhood price signals (aggregate market rates — no leakage)
-    "ppmc", "pppz", "pppp", "new_index",
-    # Neighbourhood ratios
+    # Key Colombian predictor
+    "estrato",
+    # Admin fee
+    "administracion",
+    # Proximity
+    "dist_metro_km",
+    # Neighbourhood market signals
+    "ppmc", "pppz", "pppp", "new_index", "barrio_count",
     "pppp/pppz", "pppp/ppmc", "pppz/ppmc",
-    # Listing density (count only — not price-derived)
-    "barrio_count",
-    # Target encoding (smoothed, train-only — no leakage)
+    # Smoothed target encoding (train-only)
     "barrio_te",
 ]
 CAT_ATTRIBS = ["tipo"]
-
-# ─────────────────────────────────────────────
-# 1. SCRAPER
-# ─────────────────────────────────────────────
+MLFLOW_EXPERIMENT = "medellin_re"
 
 
-def get_headers() -> dict:
-    """Minimal headers needed for metrocuadrado API."""
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. SCRAPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _mc_headers() -> dict:
     return {
         "accept": "*/*",
         "content-type": "application/json",
-        "user-agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "x-api-key": "P1MfFHfQMOtL16Zpg36NcntJYCLFm8FqFfudnavl",
     }
 
 
-def scrape(operacion: str = "arriendo", ciudad: str = "medellin",
-           num_paginas: int = 201, delay: float = 0.3) -> pd.DataFrame:
-    """
-    Scrape metrocuadrado.com listings.
-
-    Parameters
-    ----------
-    operacion   : 'arriendo' or 'venta'
-    ciudad      : city slug
-    num_paginas : pages of 50 results each (201 → ~10 000 listings)
-    delay       : seconds between requests (be polite)
-    """
-    headers = get_headers()
+def scrape_metrocuadrado(operacion: str = "arriendo", ciudad: str = "medellin",
+                         num_paginas: int = 201, delay: float = 0.3) -> pd.DataFrame:
+    """Scrape metrocuadrado — includes estrato and administración."""
     records = []
+    print(f"  [metrocuadrado] {operacion} — {num_paginas} pages...")
 
-    print(f"Scraping {operacion} — {num_paginas} pages × 50 results...")
     for page in range(num_paginas):
-        params = {
-            "size": "50",
-            "from": str(page * 50),
-            "realEstateBusinessList": operacion,
-            "city": ciudad,
-        }
+        params = {"size": "50", "from": str(page * 50),
+                  "realEstateBusinessList": operacion, "city": ciudad}
         try:
-            r = requests.get(
-                "https://www.metrocuadrado.com/rest-search/search",
-                params=params,
-                headers=headers,
-                timeout=15,
-            )
+            r = requests.get("https://www.metrocuadrado.com/rest-search/search",
+                             params=params, headers=_mc_headers(), timeout=15)
             r.raise_for_status()
             data = r.json()
         except Exception as e:
-            print(f"  Page {page}: error — {e}. Skipping.")
+            print(f"    Page {page}: {e} — skipping")
             continue
 
         results = data.get("results", [])
         if not results:
-            print(f"  Page {page}: no results, stopping early.")
             break
 
         for item in results:
-            def g(key, default=None):
+            def g(k, d=None):
                 try:
-                    return item.get(key)
-                except Exception:
-                    return default
+                    return item.get(k)
+                except:
+                    return d
 
-            precio = (
-                g("mvalorarriendo") if operacion == "arriendo" else g("mvalorventa")
-            )
+            precio = g("mvalorarriendo") if operacion == "arriendo" else g(
+                "mvalorventa")
             loc = g("localizacion") or {}
             tipo_obj = g("mtipoinmueble") or {}
-            link = g("link", "")
+            link = g("link", "") or ""
 
             records.append({
-                "barrio":        g("mnombrecomunbarrio"),
-                "barrio_1":      g("mbarrio"),
-                "precio":        precio,
-                "area":          g("marea"),
-                "habitaciones":  g("mnrocuartos"),
-                "baños":         g("mnrobanos"),
-                "parqueaderos":  g("mnrogarajes"),
-                "tipo":          tipo_obj.get("nombre"),
-                "latitud":       loc.get("lat"),
-                "longitud":      loc.get("lon"),
-                "url":           "https://www.metrocuadrado.com" + link if link else None,
+                "barrio":         g("mnombrecomunbarrio"),
+                "precio":         precio,
+                "area":           g("marea"),
+                "habitaciones":   g("mnrocuartos"),
+                "baños":          g("mnrobanos"),
+                "parqueaderos":   g("mnrogarajes"),
+                "estrato":        g("mextrato"),
+                "administracion": g("madministracion"),
+                "tipo":           tipo_obj.get("nombre"),
+                "latitud":        loc.get("lat"),
+                "longitud":       loc.get("lon"),
+                "url":            "https://www.metrocuadrado.com" + link if link else None,
+                "source":         "metrocuadrado",
             })
 
         if (page + 1) % 20 == 0:
-            print(
-                f"  {page + 1}/{num_paginas} pages done, {len(records)} records so far")
+            print(f"    {page+1}/{num_paginas} pages, {len(records)} records")
         time.sleep(delay)
 
     df = pd.DataFrame(records)
-    # Keep only Apartamento and Casa
     df = df[df["tipo"].str.contains("Apartamento|Casa", na=False, case=False)]
-    print(f"Scraped {len(df)} {operacion} listings.")
+    print(f"  [metrocuadrado] {len(df)} listings")
     return df
 
 
-# ─────────────────────────────────────────────
+def scrape_fincaraiz(operacion: str = "arriendo", ciudad: str = "medellin",
+                     num_paginas: int = 100, delay: float = 0.5) -> pd.DataFrame:
+    """
+    Fincaraíz does not expose a public JSON API.
+    Returns an empty DataFrame so scrape_all() proceeds with metrocuadrado only.
+    To add a second source in the future, implement an HTML scraper here using
+    requests + BeautifulSoup against https://www.fincaraiz.com.co/
+    """
+    print("  [fincaraiz] No public API available — skipping (metrocuadrado only)")
+    return pd.DataFrame()
+
+
+def scrape_all(operacion: str) -> pd.DataFrame:
+    mc = scrape_metrocuadrado(operacion)
+    fr = scrape_fincaraiz(operacion)
+    out = pd.concat([mc, fr], ignore_index=True)
+    before = len(out)
+    out = out.drop_duplicates(subset=["area", "precio", "latitud", "longitud"])
+    print(f"  Combined: {before} → {len(out)} rows after dedup")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 2. CLEANING
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
-def normalize_text(s: str) -> str:
-    """Lowercase + strip accents — used ONLY for join keys, never for display values."""
+def normalize_text(s) -> str:
     s = str(s).strip().lower()
-    return (
-        unicodedata.normalize("NFKD", s)
-        .encode("ASCII", "ignore")
-        .decode("ASCII")
-    )
+    return unicodedata.normalize("NFKD", s).encode("ASCII", "ignore").decode("ASCII")
 
 
-def clean_nombre(s: str) -> str:
-    """Keep the original shapefile casing — strip whitespace and expansion prefix only."""
+def clean_nombre(s) -> str:
     s = str(s).strip()
-    s = s.replace("Área de Expansión", "").replace(
-        "Area de Expansion", "").strip()
-    # Remove leading/trailing punctuation left after prefix removal
-    return s.strip(" -–—")
+    for pfx in ["Área de Expansión", "Area de Expansion"]:
+        s = s.replace(pfx, "").strip(" -–—")
+    return s
 
 
 def fix_coordinates(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop rows whose coordinates are missing or fall outside Medellín bounds.
-
-    We no longer try to rescue bad coordinates by guessing from the scraped
-    barrio string — that string is unreliable and causes the spatial join to
-    assign the wrong polygon name. Real coordinates only; everything else drops.
-    """
     b = MEDELLIN_BOUNDS
     before = len(df)
     df = df.dropna(subset=["latitud", "longitud"])
@@ -209,133 +236,100 @@ def fix_coordinates(df: pd.DataFrame) -> pd.DataFrame:
         (df["latitud"] >= b["lat_min"]) & (df["latitud"] <= b["lat_max"]) &
         (df["longitud"] >= b["lon_min"]) & (df["longitud"] <= b["lon_max"])
     ].copy()
-    dropped = before - len(df)
-    if dropped:
-        print(
-            f"    fix_coordinates: dropped {dropped} rows with bad/missing coordinates")
+    print(f"    fix_coordinates: dropped {before - len(df)} rows")
     return df.reset_index(drop=True)
 
 
-def match_barrio_names(df: pd.DataFrame, geo: gpd.GeoDataFrame,
-                       threshold: int = 80) -> pd.DataFrame:
-    """Fuzzy-match scraped barrio names to official shapefile names."""
-    ref_names = geo["NOMBRE"].astype(
-        str).str.strip().str.lower().unique().tolist()
-    df["barrio"] = df["barrio"].astype(str).str.strip().str.lower()
-
-    def best_match(name):
-        result = process.extractOne(
-            name, ref_names, scorer=fuzz.token_sort_ratio)
-        if result and result[1] >= threshold:
-            return result[0]
-        return name
-
-    df["barrio"] = df["barrio"].apply(best_match)
-    return df
-
-
 def clean(df: pd.DataFrame, geo: gpd.GeoDataFrame, operacion: str) -> pd.DataFrame:
-    """Full cleaning pipeline for one dataset."""
     print(f"  Cleaning {operacion}: {len(df)} rows...")
 
-    # Drop rows missing critical fields
     df = df.dropna(subset=["precio", "area", "habitaciones", "baños"])
-    df = df[df["precio"] > 0]
-    df = df[df["area"] > 0]
+    df = df[(df["precio"] > 0) & (df["area"] > 0)]
 
-    # Cast types
     for col in ["habitaciones", "baños", "parqueaderos"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(
             0).apply(np.floor).astype(int)
 
-    # Keep only Apartamento / Casa
-    df["tipo"] = df["tipo"].str.strip().str.lower()
+    # Estrato 1–6 only; fill with barrio median after sjoin
+    df["estrato"] = pd.to_numeric(df.get("estrato"), errors="coerce")
+    df.loc[~df["estrato"].between(1, 6), "estrato"] = np.nan
+
+    # Admin fee: cap at 5M COP, fill missing with 0
+    df["administracion"] = pd.to_numeric(
+        df.get("administracion"), errors="coerce").clip(0, 5_000_000).fillna(0)
+
+    df["tipo"] = df["tipo"].astype(str).str.strip().str.lower()
     df = df[df["tipo"].str.contains("apartamento|casa", na=False)]
 
-    # Fix coordinates
     df = fix_coordinates(df)
 
-    # Spatial join to get official barrio name
-    gdf_points = gpd.GeoDataFrame(
+    # Spatial join → official barrio name from shapefile
+    gdf_pts = gpd.GeoDataFrame(
         df, geometry=gpd.points_from_xy(df["longitud"], df["latitud"]), crs="EPSG:4326"
     )
-    geo_join = gdf_points.sjoin(geo.to_crs("EPSG:4326"), how="left")
-    # sjoin can duplicate rows for points on polygon boundaries — keep first match only
-    geo_join = geo_join[~geo_join.index.duplicated(keep="first")]
-    geo_join = geo_join.reset_index(drop=True)
-    geo_join.columns = geo_join.columns.str.lower()
-    df = pd.DataFrame(geo_join).reset_index(drop=True)
-
-    # Ensure unique index before any column assignment
-    df = df.reset_index(drop=True)
-
-    # Use ONLY the shapefile NOMBRE — the authoritative neighbourhood name.
-    # geo_join.columns.str.lower() made it "nombre" but the VALUE is still the
-    # original mixed-case string from the shapefile (e.g. "El Poblado").
-    # We keep the original casing — only strip whitespace and expansion prefix.
+    joined = gdf_pts.sjoin(geo.to_crs("EPSG:4326"), how="left")
+    joined = joined[~joined.index.duplicated(
+        keep="first")].reset_index(drop=True)
+    joined.columns = joined.columns.str.lower()
+    df = pd.DataFrame(joined).reset_index(drop=True)
     df["nombre"] = df["nombre"].astype(str).apply(clean_nombre)
-
-    # Drop rows the sjoin couldn't assign to any polygon
-    df = df[df["nombre"].str.len() > 0]
     df = df[~df["nombre"].str.lower().isin(["nan", "none", ""])]
 
-    # ── Outlier removal ─────────────────────────────────────────────────────
-    # Use a wider IQR fence (3× instead of 1.5×) so high-end properties
-    # are NOT removed — they're real data, not errors.
-    # Also enforce a sensible absolute minimum.
-    if operacion == "arriendo":
-        # floor: no real rental below 500k COP
-        df = df[df["precio"] >= 500_000]
-    else:
-        # floor: no real sale below 50M COP
-        df = df[df["precio"] >= 50_000_000]
+    # Fill missing estrato with barrio median, then global median
+    e_med = df.groupby("nombre")["estrato"].median()
+    df["estrato"] = df["estrato"].fillna(df["nombre"].map(e_med))
+    df["estrato"] = df["estrato"].fillna(df["estrato"].median()).clip(1, 6)
 
-    Q1 = df["precio"].quantile(0.25)
-    Q3 = df["precio"].quantile(0.75)
-    IQR = Q3 - Q1
-    upper = Q3 + 3.0 * IQR   # wide fence — keep luxury properties
-    df = df[df["precio"] <= upper]
-
-    # Area outliers (data entry errors: 5000 m² apartments)
+    # Outlier removal — 3× IQR keeps luxury
+    price_floor = 500_000 if operacion == "arriendo" else 50_000_000
+    df = df[df["precio"] >= price_floor]
+    Q1, Q3 = df["precio"].quantile(0.25), df["precio"].quantile(0.75)
+    df = df[df["precio"] <= Q3 + 3.0 * (Q3 - Q1)]
     df = df[df["area"] <= df["area"].quantile(0.99)]
 
-    df = df[["tipo", "precio", "area", "habitaciones", "baños",
-             "parqueaderos", "nombre", "latitud", "longitud", "url"]].dropna(subset=["nombre"])
+    keep = ["tipo", "precio", "area", "habitaciones", "baños", "parqueaderos",
+            "estrato", "administracion", "nombre", "latitud", "longitud", "url", "source"]
+    keep = [c for c in keep if c in df.columns]
+    df = df[keep].dropna(subset=["nombre"]).reset_index(drop=True)
 
-    print(f"  After cleaning: {len(df)} rows | precio range: "
-          f"{df['precio'].min():,.0f} → {df['precio'].max():,.0f}")
-    return df.reset_index(drop=True)
+    print(f"  After cleaning: {len(df)} rows | "
+          f"precio {df['precio'].min():,.0f}–{df['precio'].max():,.0f} | "
+          f"estrato coverage {df['estrato'].notna().mean()*100:.0f}%")
+    return df
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # 3. FEATURE ENGINEERING
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+def add_metro_distance(df: pd.DataFrame) -> pd.DataFrame:
+    """Vectorised nearest-station distance in km."""
+    print("  Computing metro distances...")
+    station_coords = np.array([(slat, slon)
+                              for _, slat, slon in METRO_STATIONS])
+    props = df[["latitud", "longitud"]].values
+    lat_m = props[:, 0].mean()
+    scale = np.array([111.0, 111.0 * np.cos(np.radians(lat_m))])
+    diffs = props[:, np.newaxis, :] - station_coords[np.newaxis, :, :]
+    dist = np.sqrt(((diffs * scale) ** 2).sum(axis=2)).min(axis=1)
+    df = df.copy()
+    df["dist_metro_km"] = dist
+    return df
+
 
 def price_aggregates(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Compute neighbourhood-level price aggregates."""
-    precio_tot = df.groupby("nombre")["precio"].sum().astype(float)
-    area_tot = df.groupby("nombre")["area"].sum().replace(
-        0, np.nan).astype(float)
-    espacios = df.groupby("nombre")["espacios"].sum().astype(float)
-    parq = (df.groupby("nombre")["parqueaderos"].sum() + 1).astype(float)
-
-    ppmc = (precio_tot / area_tot).dropna().sort_values(ascending=False)
-    pppz = (precio_tot / espacios).dropna().sort_values(ascending=False)
-    pppp = (precio_tot / parq).dropna().sort_values(ascending=False)
-    return ppmc, pppz, pppp
+    pt = df.groupby("nombre")["precio"].sum().astype(float)
+    at = df.groupby("nombre")["area"].sum().replace(0, np.nan).astype(float)
+    esp = df.groupby("nombre")["espacios"].sum().astype(float)
+    pq = (df.groupby("nombre")["parqueaderos"].sum() + 1).astype(float)
+    return (pt / at).dropna(), (pt / esp).dropna(), (pt / pq).dropna()
 
 
 def engineer_features(df: pd.DataFrame,
-                      ppmc: pd.Series,
-                      pppz: pd.Series,
-                      pppp: pd.Series) -> pd.DataFrame:
-    """Add all engineered features. barrio_te is NOT added here to avoid leakage
-    — it is computed train-only inside prep_dataset and mapped to test rows."""
+                      ppmc: pd.Series, pppz: pd.Series, pppp: pd.Series) -> pd.DataFrame:
+    """All features except barrio_te — computed train-only in prep()."""
     df = df.copy()
-
     df["espacios"] = df["habitaciones"] + df["parqueaderos"] + df["baños"]
-
-    # Per-unit area ratios
     df["axe"] = np.where(df["espacios"] == 0, df["area"],
                          df["area"] / df["espacios"])
     df["axh"] = np.where(df["habitaciones"] == 0, df["area"],
@@ -343,337 +337,414 @@ def engineer_features(df: pd.DataFrame,
     df["axa"] = df["area"] ** 2
     df["parq2"] = df["parqueaderos"] ** 2
     df["garaje_bin"] = (df["parqueaderos"] > 0).astype(int)
-
-    # Neighbourhood price signals
     df["ppmc"] = df["nombre"].map(ppmc)
     df["pppz"] = df["nombre"].map(pppz)
     df["pppp"] = df["nombre"].map(pppp)
+    df["new_index"] = df["ppmc"] / ppmc.max() * 100
 
-    ppmc_max = ppmc.max()
-    df["new_index"] = df["ppmc"] / ppmc_max * 100
-
-    def safe_ratio(a, b):
+    def sr(a, b):
         return (a / b).replace([np.inf, -np.inf], np.nan).fillna(1).astype(float)
 
-    df["pppp/pppz"] = safe_ratio(df["pppp"], df["pppz"])
-    df["pppp/ppmc"] = safe_ratio(df["pppp"], df["ppmc"])
-    df["pppz/ppmc"] = safe_ratio(df["pppz"], df["ppmc"])
-
-    # Listing density — count of properties per barrio (no leakage)
+    df["pppp/pppz"] = sr(df["pppp"], df["pppz"])
+    df["pppp/ppmc"] = sr(df["pppp"], df["ppmc"])
+    df["pppz/ppmc"] = sr(df["pppz"], df["ppmc"])
     df["barrio_count"] = df["nombre"].map(
         df.groupby("nombre")["precio"].count())
-
-    # Placeholder for barrio_te — filled correctly in prep_dataset (train-only)
     df["barrio_te"] = np.nan
 
-    # Drop rows where neighbourhood aggregates are missing
     df = df.dropna(subset=["ppmc", "pppz", "pppp", "pppz/ppmc"])
-
     return df.reset_index(drop=True)
 
 
-# ─────────────────────────────────────────────
-# 4. FEATURE SELECTION
-# ─────────────────────────────────────────────
-
-def select_features(X_train: pd.DataFrame, y_train: pd.Series,
-                    max_features: int = 10, cv: int = 5) -> list[str]:
-    """
-    Select best feature subset using XGBoost feature importances
-    (much faster and more reliable than exhaustive LinearRegression search).
-    """
-    from sklearn.model_selection import cross_val_score
-
-    print("  Selecting features via XGBoost importances...")
-
-    # Fit a quick XGBoost on all features
-    probe = XGBRegressor(n_estimators=200, max_depth=4, learning_rate=0.1,
-                         subsample=0.8, random_state=42)
-    probe.fit(X_train, y_train)
-
-    importances = pd.Series(probe.feature_importances_, index=X_train.columns)
-    # Take top max_features by importance
-    top_features = importances.nlargest(max_features).index.tolist()
-
-    # Validate with cross-val R²
-    cv_r2 = cross_val_score(probe, X_train[top_features], y_train,
-                            cv=cv, scoring="r2").mean()
-    print(f"  Selected {len(top_features)} features | CV R²: {cv_r2:.4f}")
-    print(f"  Features: {top_features}")
-    return top_features
-
-
-# ─────────────────────────────────────────────
-# 5. PREPROCESSOR
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. PREPROCESSOR
+# ─────────────────────────────────────────────────────────────────────────────
 
 def make_preprocessor() -> ColumnTransformer:
-    """Create a fresh (unfitted) preprocessor — call once per dataset."""
     return ColumnTransformer([
-        ("num", Pipeline([("scaler", StandardScaler())]), NUM_ATTRIBS),
+        ("num", Pipeline([("scaler", StandardScaler())]),
+         NUM_ATTRIBS),
         ("cat", Pipeline(
-            [("ohe", OneHotEncoder(handle_unknown="ignore"))]), CAT_ATTRIBS),
+            [("ohe",   OneHotEncoder(handle_unknown="ignore"))]), CAT_ATTRIBS),
     ])
 
 
-# ─────────────────────────────────────────────
-# ─────────────────────────────────────────────
-# 6. TRAINING  (Bayesian hyperparameter search + early stopping refit)
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. FEATURE SELECTION
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Search space — 8 dimensions covering the parameters that matter most
-# for gradient-boosted trees on ~7k rows
-XGB_SEARCH_SPACE = {
-    "learning_rate":    Real(0.005, 0.1,  prior="log-uniform"),
-    "max_depth":        Integer(3, 6),
-    "min_child_weight": Integer(4, 20),
-    "subsample":        Real(0.6, 0.95,  prior="uniform"),
-    "colsample_bytree": Real(0.5, 0.95,  prior="uniform"),
-    "gamma":            Real(0.0, 0.5,   prior="uniform"),
-    "reg_alpha":        Real(1e-3, 5.0,  prior="log-uniform"),
-    "reg_lambda":       Real(0.5, 8.0,   prior="log-uniform"),
-}
+def select_features(X: pd.DataFrame, y: pd.Series, max_features: int = 22) -> list[str]:
+    probe = XGBRegressor(n_estimators=300, max_depth=4, learning_rate=0.1,
+                         subsample=0.8, random_state=42, verbosity=0)
+    probe.fit(X, y)
+    top = pd.Series(probe.feature_importances_, index=X.columns).nlargest(
+        max_features).index.tolist()
+    cv_r2 = cross_val_score(probe, X[top], y, cv=5, scoring="r2").mean()
+    print(f"  Feature selection: {len(top)} features | CV R²: {cv_r2:.4f}")
+    print(f"  {top}")
+    return top
 
 
-def train_xgb(X_train: pd.DataFrame, y_train: pd.Series,
-              X_test: pd.DataFrame,  y_test: pd.Series,
-              label: str,
-              n_iter: int = 40,
-              cv: int = 5) -> XGBRegressor:
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. OPTUNA TUNING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _xgb_obj(trial, X, y):
+    p = dict(
+        n_estimators=trial.suggest_int("n_estimators", 300, 1500),
+        learning_rate=trial.suggest_float(
+            "learning_rate", 0.005, 0.1, log=True),
+        max_depth=trial.suggest_int("max_depth", 3, 6),
+        min_child_weight=trial.suggest_int("min_child_weight", 3, 20),
+        subsample=trial.suggest_float("subsample", 0.6, 0.95),
+        colsample_bytree=trial.suggest_float("colsample_bytree", 0.5, 0.95),
+        gamma=trial.suggest_float("gamma", 0.0, 0.5),
+        reg_alpha=trial.suggest_float("reg_alpha", 1e-3, 5.0, log=True),
+        reg_lambda=trial.suggest_float("reg_lambda", 0.5, 8.0, log=True),
+        random_state=42, verbosity=0, n_jobs=-1,
+    )
+    return cross_val_score(XGBRegressor(**p), _safe_X(X), y, cv=5, scoring="r2").mean()
+
+
+def _lgb_obj(trial, X, y):
+    p = dict(
+        n_estimators=trial.suggest_int("n_estimators", 300, 1500),
+        learning_rate=trial.suggest_float(
+            "learning_rate", 0.005, 0.1, log=True),
+        max_depth=trial.suggest_int("max_depth", 3, 7),
+        num_leaves=trial.suggest_int("num_leaves", 15, 63),
+        min_child_samples=trial.suggest_int("min_child_samples", 10, 50),
+        subsample=trial.suggest_float("subsample", 0.6, 0.95),
+        colsample_bytree=trial.suggest_float("colsample_bytree", 0.5, 0.95),
+        reg_alpha=trial.suggest_float("reg_alpha", 1e-3, 5.0, log=True),
+        reg_lambda=trial.suggest_float("reg_lambda", 0.5, 8.0, log=True),
+        random_state=42, verbose=-1, n_jobs=-1,
+    )
+    return cross_val_score(LGBMRegressor(**p), _safe_X(X), y, cv=5, scoring="r2").mean()
+
+
+def _safe_X(X: pd.DataFrame) -> pd.DataFrame:
+    """Replace inf/nan with column medians — applied before every model fit."""
+    X = X.replace([np.inf, -np.inf], np.nan)
+    return X.fillna(X.median())
+
+
+def _cat_obj(trial, X, y):
+    p = dict(
+        iterations=trial.suggest_int("iterations", 300, 1000),
+        learning_rate=trial.suggest_float(
+            "learning_rate", 0.01, 0.15, log=True),
+        depth=trial.suggest_int("depth", 4, 8),
+        l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 1.0, 10.0, log=True),
+        random_seed=42, verbose=0,
+    )
+    return cross_val_score(CatBoostRegressor(**p), _safe_X(X), y, cv=5, scoring="r2").mean()
+
+
+def tune(X: pd.DataFrame, y: pd.Series, n_trials: int = 50) -> dict:
+    best = {}
+    for name, obj in [("xgb", _xgb_obj), ("lgb", _lgb_obj), ("cat", _cat_obj)]:
+        print(f"  Tuning {name} ({n_trials} trials)...")
+        study = optuna.create_study(direction="maximize",
+                                    sampler=optuna.samplers.TPESampler(seed=42))
+        X_safe = _safe_X(X)
+        study.optimize(lambda t: obj(t, X_safe, y), n_trials=n_trials)
+        best[name] = study.best_params
+        print(f"    {name} best CV R²: {study.best_value:.4f}")
+    return best
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. STACKED ENSEMBLE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StackedEnsemble:
     """
-    Two-stage training:
-      1. BayesSearchCV explores the param space with n_iter evaluations
-         using n_estimators=500 per candidate (fast).
-      2. Best params refitted with n_estimators=2000 + early stopping
-         to find the exact tree count.
-
-    n_iter=40 → ~5-10 min on a laptop. Raise to 60-80 for a deeper search.
+    Level-0 : XGBoost + LightGBM + CatBoost  (OOF predictions, 5-fold CV)
+    Level-1 : Ridge meta-learner
     """
-    print(
-        f'  Bayesian search ({label}): {n_iter} iterations x {cv}-fold CV...')
 
-    # Stage 1: search
-    base = XGBRegressor(
-        n_estimators=500,
-        eval_metric="rmse",
-        random_state=42,
-        n_jobs=1,
-        verbosity=0,
-    )
-    search = BayesSearchCV(
-        base,
-        XGB_SEARCH_SPACE,
-        n_iter=n_iter,
-        cv=cv,
-        scoring="r2",
-        refit=False,
-        random_state=42,
-        n_jobs=-1,
-        verbose=0,
-    )
-    search.fit(X_train, y_train)
-    best_params = dict(search.best_params_)
+    def __init__(self, xgb_p: dict, lgb_p: dict, cat_p: dict):
+        self.xgb_p, self.lgb_p, self.cat_p = xgb_p, lgb_p, cat_p
+        self.base_: list = []
+        self.meta_: Ridge | None = None
 
-    print(f'  Best CV R2     : {search.best_score_:.4f}')
-    print(f'  Best params:')
-    for k, v in sorted(best_params.items()):
-        print(f'    {k}: {v}')
+    def _factories(self):
+        return [
+            lambda: XGBRegressor(
+                **self.xgb_p, random_state=42, verbosity=0, n_jobs=-1),
+            lambda: LGBMRegressor(
+                **self.lgb_p, random_state=42, verbose=-1,  n_jobs=-1),
+            lambda: CatBoostRegressor(**self.cat_p, random_seed=42, verbose=0),
+        ]
 
-    # Stage 2: refit with early stopping
-    X_tr, X_val, y_tr, y_val = train_test_split(
-        X_train, y_train, test_size=0.15, random_state=42
-    )
-    model = XGBRegressor(
-        **best_params,
-        n_estimators=2000,
-        early_stopping_rounds=50,
-        eval_metric="rmse",
-        random_state=42,
-        n_jobs=-1,
-        verbosity=0,
-    )
-    model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+    def fit(self, X: pd.DataFrame, y: pd.Series, cv: int = 5) -> "StackedEnsemble":
+        kf = KFold(n_splits=cv, shuffle=True, random_state=42)
+        oof = np.zeros((len(X), 3))
 
-    # Evaluate
-    y_pred_log = model.predict(X_test)
+        print("  Training stacked ensemble (5-fold OOF)...")
+        for mi, factory in enumerate(self._factories()):
+            name = ["XGB", "LGB", "CAT"][mi]
+            fold_r2 = []
+            for tr_i, va_i in kf.split(X):
+                m = factory()
+                m.fit(_safe_X(X.iloc[tr_i]), y.iloc[tr_i])
+                oof[va_i, mi] = m.predict(_safe_X(X.iloc[va_i]))
+                fold_r2.append(r2_score(y.iloc[va_i], oof[va_i, mi]))
+            print(
+                f"    {name} OOF R²: {np.mean(fold_r2):.4f} ± {np.std(fold_r2):.4f}")
+            m_full = factory()
+            m_full.fit(_safe_X(X), y)
+            self.base_.append(m_full)
+
+        self.meta_ = Ridge(alpha=1.0)
+        self.meta_.fit(oof, y)
+        print(
+            f"    Ensemble OOF R²: {r2_score(y, self.meta_.predict(oof)):.4f}")
+        print(f"    Weights — XGB:{self.meta_.coef_[0]:.3f}  "
+              f"LGB:{self.meta_.coef_[1]:.3f}  CAT:{self.meta_.coef_[2]:.3f}")
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        X = _safe_X(X)
+        return self.meta_.predict(
+            np.column_stack([m.predict(X) for m in self.base_])
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. QUANTILE MODELS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_quantile_models(X_tr, y_tr, X_te, y_te, label) -> tuple:
+    print(f"  Quantile models ({label})...")
+    models = {}
+    for q, name in [(0.10, "q10"), (0.90, "q90")]:
+        m = XGBRegressor(
+            objective="reg:quantileerror", quantile_alpha=q,
+            n_estimators=600, learning_rate=0.05, max_depth=4,
+            subsample=0.8, colsample_bytree=0.8,
+            random_state=42, n_jobs=-1, verbosity=0,
+        )
+        m.fit(X_tr, y_tr)
+        pred = np.expm1(m.predict(X_te))
+        actual = np.expm1(y_te)
+        coverage = (pred <= actual).mean() if q == 0.90 else (
+            pred >= actual).mean()
+        print(f"    {name}: coverage={coverage:.1%}")
+        models[name] = m
+    return models["q10"], models["q90"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. EVALUATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate(model, X_te, y_te, label: str) -> dict:
+    y_pred_log = model.predict(X_te)
     y_pred_real = np.expm1(y_pred_log)
-    y_test_real = np.expm1(y_test)
-    r2 = r2_score(y_test, y_pred_log)
-    mae = mean_absolute_error(y_test_real, y_pred_real)
-    mape = np.median(np.abs(y_pred_real - y_test_real) / y_test_real) * 100
+    y_real = np.expm1(y_te)
+    r2 = r2_score(y_te, y_pred_log)
+    mae = mean_absolute_error(y_real, y_pred_real)
+    mape = np.median(np.abs(y_pred_real - y_real) / y_real) * 100
 
-    print(f'\n  -- {label} final results --')
-    print(f'  Best iteration : {model.best_iteration}')
-    print(f'  R2 (log space) : {r2:.4f}')
-    print(f'  MAE (COP)      : ${mae:,.0f}')
-    print(f'  Median APE     : {mape:.1f}%')
+    print(f"\n  ── {label} ──────────────────────────────")
+    print(f"  R² (log-space) : {r2:.4f}")
+    print(f"  MAE            : ${mae:,.0f} COP")
+    print(f"  Median APE     : {mape:.1f}%")
 
-    bucket_df = pd.DataFrame({'actual': y_test_real, 'pred': y_pred_real})
-    bins = [0, 2e6, 4e6, 6e6, 8e6, 15e6, 1e12] if "arr" in label.lower() else \
-        [0, 200e6, 400e6, 600e6, 1e9, 2e9, 1e12]
-    labels_b = ["<2M", "2-4M", "4-6M", "6-8M", "8-15M", ">15M"] if "arr" in label.lower() else \
-               ["<200M", "200-400M", "400-600M", "600M-1B", "1-2B", ">2B"]
-    bucket_df['bucket'] = pd.cut(
-        bucket_df['actual'], bins=bins, labels=labels_b)
-    breakdown = bucket_df.groupby('bucket', observed=True).apply(
-        lambda g: pd.Series({
-            'n': len(g),
-            'median_APE%': np.median(np.abs(g['pred'] - g['actual']) / g['actual'] * 100)
-        })
-    )
-    print(f'\n  Error by price bucket:\n{breakdown.to_string()}\n')
-
-    return model
+    is_arr = "arr" in label.lower()
+    bins = [0, 2e6, 4e6, 6e6, 8e6, 15e6, 1e12] if is_arr else [
+        0, 200e6, 400e6, 600e6, 1e9, 2e9, 1e12]
+    lbls = ["<2M", "2-4M", "4-6M", "6-8M", "8-15M", ">15M"] if is_arr else \
+           ["<200M", "200-400M", "400-600M", "600M-1B", "1-2B", ">2B"]
+    bd = pd.DataFrame({"a": y_real, "p": y_pred_real})
+    bd["bucket"] = pd.cut(bd["a"], bins=bins, labels=lbls)
+    print(bd.groupby("bucket", observed=True).apply(
+        lambda g: pd.Series({"n": len(g),
+                             "med_APE%": np.median(np.abs(g.p-g.a)/g.a*100)})
+    ).to_string())
+    return {"r2": r2, "mae": mae, "mape": mape}
 
 
-# 7. SAVE ARTIFACTS
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. SAVE
+# ─────────────────────────────────────────────────────────────────────────────
 
 def save(obj, name: str):
-    path = ARTIFACTS_DIR / f"{name}.pkl"
-    with open(path, "wb") as f:
+    p = ARTIFACTS_DIR / f"{name}.pkl"
+    with open(p, "wb") as f:
         pickle.dump(obj, f)
-    print(f"  Saved → {path}")
+    print(f"  Saved → {p}")
 
 
-# ─────────────────────────────────────────────
-# 8. FULL PIPELINE
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. FULL PIPELINE
+# ─────────────────────────────────────────────────────────────────────────────
 
-def run_pipeline(skip_scrape: bool = False, mode: str = "both"):
-    geo = gpd.read_file("med.shp")
+def run_pipeline(skip_scrape: bool = False, mode: str = "both", fast: bool = False):
+    n_trials = 20 if fast else 50
+    mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
-    # ── Scrape or load ───────────────────────────────────────────────────────
-    if skip_scrape:
-        print("Loading existing CSVs...")
-        arr_raw = pd.read_csv("arriendo_medellin.csv")
-        ven_raw = pd.read_csv("venta_medellin.csv")
-    else:
-        arr_raw = scrape("arriendo", num_paginas=201)
-        ven_raw = scrape("venta",    num_paginas=201)
-        arr_raw.to_csv("arriendo_medellin.csv", index=False)
-        ven_raw.to_csv("venta_medellin.csv",    index=False)
+    with mlflow.start_run(run_name=f"train_{mode}"):
+        geo = gpd.read_file("med.shp")
 
-    # ── Clean ────────────────────────────────────────────────────────────────
-    print("\n[1/4] Cleaning...")
-    arr_clean = clean(arr_raw, geo, "arriendo")
-    ven_clean = clean(ven_raw, geo, "venta")
+        # Scrape ──────────────────────────────────────────────────────────────
+        if skip_scrape:
+            print("Loading existing CSVs...")
+            arr_raw = pd.read_csv("arriendo_medellin.csv")
+            ven_raw = pd.read_csv("venta_medellin.csv")
+        else:
+            print("\n[Scraping]")
+            arr_raw = scrape_all("arriendo")
+            ven_raw = scrape_all("venta")
+            arr_raw.to_csv("arriendo_medellin.csv", index=False)
+            ven_raw.to_csv("venta_medellin.csv",    index=False)
 
-    # ── Feature engineering ──────────────────────────────────────────────────
-    print("\n[2/4] Engineering features...")
-    ppmc_arr, pppz_arr, pppp_arr = price_aggregates(
-        arr_clean.assign(
-            espacios=arr_clean["habitaciones"] + arr_clean["parqueaderos"] + arr_clean["baños"])
-    )
-    ppmc_ven, pppz_ven, pppp_ven = price_aggregates(
-        ven_clean.assign(
-            espacios=ven_clean["habitaciones"] + ven_clean["parqueaderos"] + ven_clean["baños"])
-    )
+        # Clean ───────────────────────────────────────────────────────────────
+        print("\n[1/5] Cleaning...")
+        arr_clean = clean(arr_raw, geo, "arriendo")
+        ven_clean = clean(ven_raw, geo, "venta")
 
-    arr = engineer_features(arr_clean, ppmc_arr, pppz_arr, pppp_arr)
-    ven = engineer_features(ven_clean, ppmc_ven, pppz_ven, pppp_ven)
+        # Feature engineering ─────────────────────────────────────────────────
+        print("\n[2/5] Engineering features...")
+        arr_clean = add_metro_distance(arr_clean)
+        ven_clean = add_metro_distance(ven_clean)
 
-    # Save processed data
-    arr.to_csv("arr_mede_final.csv", index=False)
-    ven.to_csv("ven_mede_final.csv", index=False)
-    print(
-        f"  arr_mede_final: {len(arr)} rows | ven_mede_final: {len(ven)} rows")
+        for df in [arr_clean, ven_clean]:
+            df["espacios"] = df["habitaciones"] + \
+                df["parqueaderos"] + df["baños"]
 
-    list_barrios = sorted(arr["nombre"].unique().tolist())
+        ppmc_arr, pppz_arr, pppp_arr = price_aggregates(arr_clean)
+        ppmc_ven, pppz_ven, pppp_ven = price_aggregates(ven_clean)
 
-    # ── Preprocess + select features ─────────────────────────────────────────
-    print("\n[3/4] Preprocessing & feature selection...")
+        arr = engineer_features(arr_clean, ppmc_arr, pppz_arr, pppp_arr)
+        ven = engineer_features(ven_clean, ppmc_ven, pppz_ven, pppp_ven)
 
-    def prep_dataset(df, label):
-        y_full = np.log1p(df["precio"])
+        arr.to_csv("arr_mede_final.csv", index=False)
+        ven.to_csv("ven_mede_final.csv", index=False)
+        print(f"  arr: {len(arr)} rows | ven: {len(ven)} rows")
 
-        # Split BEFORE computing barrio_te to prevent leakage
-        idx_tr, idx_te = train_test_split(
-            df.index, test_size=0.2, random_state=1954
-        )
-        df_tr = df.loc[idx_tr].copy()
-        df_te = df.loc[idx_te].copy()
-        y_tr = y_full.loc[idx_tr]
-        y_te = y_full.loc[idx_te]
+        mlflow.log_params({
+            "arr_rows": len(arr), "ven_rows": len(ven),
+            "n_barrios_arr": arr["nombre"].nunique(),
+            "n_barrios_ven": ven["nombre"].nunique(),
+            "n_trials": n_trials,
+        })
 
-        # Smoothed target encoding — computed on train rows only.
-        # Blends barrio mean with global mean: smoothing = count / (count + k)
-        # k=10 means barrios with <10 listings lean heavily on the global mean.
-        k = 10
-        global_mean = y_tr.mean()
-        barrio_stats = y_tr.groupby(df_tr["nombre"]).agg(["mean", "count"])
-        smoothing = barrio_stats["count"] / (barrio_stats["count"] + k)
-        barrio_te_map = smoothing * \
-            barrio_stats["mean"] + (1 - smoothing) * global_mean
-        df_tr["barrio_te"] = df_tr["nombre"].map(
-            barrio_te_map).fillna(global_mean)
-        df_te["barrio_te"] = df_te["nombre"].map(
-            barrio_te_map).fillna(global_mean)
+        list_barrios = sorted(arr["nombre"].unique().tolist())
 
-        X_tr = df_tr[NUM_ATTRIBS + CAT_ATTRIBS]
-        X_te = df_te[NUM_ATTRIBS + CAT_ATTRIBS]
+        # Preprocess ──────────────────────────────────────────────────────────
+        print("\n[3/5] Preprocessing & feature selection...")
 
-        # SEPARATE preprocessor per dataset
-        pp = make_preprocessor()
-        X_tr_t = pd.DataFrame(pp.fit_transform(
-            X_tr), columns=pp.get_feature_names_out())
-        X_te_t = pd.DataFrame(pp.transform(
-            X_te),     columns=pp.get_feature_names_out())
+        def prep(df):
+            y_full = np.log1p(df["precio"])
+            idx_tr, idx_te = train_test_split(
+                df.index, test_size=0.2, random_state=1954)
+            df_tr, df_te = df.loc[idx_tr].copy(), df.loc[idx_te].copy()
+            y_tr,  y_te = y_full.loc[idx_tr], y_full.loc[idx_te]
 
-        best_cols = select_features(X_tr_t, y_tr, max_features=20)
+            # Smoothed target encoding — computed on train split only
+            k = 10
+            global_mean = y_tr.mean()
+            stats = y_tr.groupby(df_tr["nombre"]).agg(["mean", "count"])
+            smooth = stats["count"] / (stats["count"] + k)
+            te_map = smooth * stats["mean"] + (1 - smooth) * global_mean
+            df_tr["barrio_te"] = df_tr["nombre"].map(
+                te_map).fillna(global_mean)
+            df_te["barrio_te"] = df_te["nombre"].map(
+                te_map).fillna(global_mean)
 
-        return pp, X_tr_t, X_te_t, y_tr, y_te, best_cols, barrio_te_map
+            X_tr, X_te = df_tr[NUM_ATTRIBS +
+                               CAT_ATTRIBS], df_te[NUM_ATTRIBS + CAT_ATTRIBS]
+            pp = make_preprocessor()
+            X_tr_t = pd.DataFrame(pp.fit_transform(
+                X_tr), columns=pp.get_feature_names_out())
+            X_te_t = pd.DataFrame(pp.transform(
+                X_te),     columns=pp.get_feature_names_out())
+            cols = select_features(X_tr_t, y_tr, max_features=22)
+            return pp, X_tr_t[cols], X_te_t[cols], y_tr, y_te, cols, te_map
 
-    pp_arr, X_tr_arr, X_te_arr, y_tr_arr, y_te_arr, best_cols_arr, barrio_te_arr = prep_dataset(
-        arr, "arriendo")
-    pp_ven, X_tr_ven, X_te_ven, y_tr_ven, y_te_ven, best_cols_ven, barrio_te_ven = prep_dataset(
-        ven, "venta")
+        pp_arr, X_tr_arr, X_te_arr, y_tr_arr, y_te_arr, cols_arr, te_arr = prep(
+            arr)
+        pp_ven, X_tr_ven, X_te_ven, y_tr_ven, y_te_ven, cols_ven, te_ven = prep(
+            ven)
 
-    # ── Train ────────────────────────────────────────────────────────────────
-    print("\n[4/4] Training models...")
+        # Optuna tuning ───────────────────────────────────────────────────────
+        print("\n[4/5] Hyperparameter tuning (Optuna)...")
+        best_arr = best_ven = {}
+        if mode in ("both", "arriendo"):
+            print("  Arriendo models...")
+            best_arr = tune(X_tr_arr, y_tr_arr, n_trials)
+        if mode in ("both", "venta"):
+            print("  Venta models...")
+            best_ven = tune(X_tr_ven, y_tr_ven, n_trials)
 
-    if mode in ("both", "arriendo"):
-        print("\nTraining arriendo model...")
-        model_arr = train_xgb(X_tr_arr[best_cols_arr], y_tr_arr,
-                              X_te_arr[best_cols_arr], y_te_arr, "Arriendo")
+        # Train ───────────────────────────────────────────────────────────────
+        print("\n[5/5] Training ensembles + quantile models...")
+        metrics = {}
+        stack_arr = stack_ven = q10_arr = q90_arr = q10_ven = q90_ven = None
 
-    if mode in ("both", "venta"):
-        print("\nTraining venta model...")
-        model_ven = train_xgb(X_tr_ven[best_cols_ven], y_tr_ven,
-                              X_te_ven[best_cols_ven], y_te_ven, "Venta")
+        if mode in ("both", "arriendo"):
+            stack_arr = StackedEnsemble(
+                best_arr["xgb"], best_arr["lgb"], best_arr["cat"]
+            ).fit(X_tr_arr, y_tr_arr)
+            q10_arr, q90_arr = train_quantile_models(
+                X_tr_arr, y_tr_arr, X_te_arr, y_te_arr, "Arriendo")
+            metrics["arr"] = evaluate(
+                stack_arr, X_te_arr, y_te_arr, "Arriendo Ensemble")
 
-    # ── Save all artifacts ───────────────────────────────────────────────────
-    print("\nSaving artifacts...")
-    save(pp_arr,         "preprocessor_arr")
-    save(pp_ven,         "preprocessor_ven")
-    save(best_cols_arr,  "best_features_arr")
-    save(best_cols_ven,  "best_features_ven")
-    save(model_arr,      "xgb_model_arr_med")
-    save(model_ven,      "xgb_model_ven_med")
-    save(ppmc_arr,       "price_per_m2_arr")
-    save(ppmc_ven,       "price_per_m2_ven")
-    save(pppz_arr,       "price_per_space_arr")
-    save(pppz_ven,       "price_per_space_ven")
-    save(pppp_arr,       "price_per_parking_arr")
-    save(pppp_ven,       "price_per_parking_ven")
-    save(list_barrios,   "list_barrios")
-    save(barrio_te_arr,  "barrio_te_arr")
-    save(barrio_te_ven,  "barrio_te_ven")
+        if mode in ("both", "venta"):
+            stack_ven = StackedEnsemble(
+                best_ven["xgb"], best_ven["lgb"], best_ven["cat"]
+            ).fit(X_tr_ven, y_tr_ven)
+            q10_ven, q90_ven = train_quantile_models(
+                X_tr_ven, y_tr_ven, X_te_ven, y_te_ven, "Venta")
+            metrics["ven"] = evaluate(
+                stack_ven, X_te_ven, y_te_ven, "Venta Ensemble")
 
-    print("\n✓ Pipeline complete. All artifacts saved to ./artifacts/")
-    print("  Update app.py to load from ./artifacts/ and use preprocessor_arr / preprocessor_ven.")
+        # MLflow ──────────────────────────────────────────────────────────────
+        for split, m in metrics.items():
+            mlflow.log_metrics({f"r2_{split}": m["r2"],
+                                f"mae_{split}": m["mae"],
+                                f"mape_{split}": m["mape"]})
+
+        # Save ────────────────────────────────────────────────────────────────
+        print("\nSaving artifacts...")
+        save(pp_arr,       "preprocessor_arr")
+        save(pp_ven,       "preprocessor_ven")
+        save(cols_arr,     "best_features_arr")
+        save(cols_ven,     "best_features_ven")
+        save(te_arr,       "barrio_te_arr")
+        save(te_ven,       "barrio_te_ven")
+        save(stack_arr,    "stack_arr")
+        save(stack_ven,    "stack_ven")
+        save(q10_arr,      "q10_arr")
+        save(q90_arr,      "q90_arr")
+        save(q10_ven,      "q10_ven")
+        save(q90_ven,      "q90_ven")
+        save(ppmc_arr,     "price_per_m2_arr")
+        save(ppmc_ven,     "price_per_m2_ven")
+        save(pppz_arr,     "price_per_space_arr")
+        save(pppz_ven,     "price_per_space_ven")
+        save(pppp_arr,     "price_per_parking_arr")
+        save(pppp_ven,     "price_per_parking_ven")
+        save(list_barrios, "list_barrios")
+        save(METRO_STATIONS, "metro_stations")
+        save({"arr": metrics.get("arr", {}).get("r2", 0),
+              "ven": metrics.get("ven", {}).get("r2", 0)}, "model_r2")
+
+        mlflow.log_artifacts(str(ARTIFACTS_DIR))
+        print("\n✓ Done.  Run: mlflow ui   to inspect results.")
 
 
-# ─────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Medellín RE training pipeline")
-    parser.add_argument("--skip-scrape", action="store_true",
-                        help="Skip scraping, use existing arriendo/venta_medellin.csv")
-    parser.add_argument("--mode", choices=["both", "arriendo", "venta"],
-                        default="both", help="Which model(s) to train")
-    args = parser.parse_args()
-
-    run_pipeline(skip_scrape=args.skip_scrape, mode=args.mode)
+    p = argparse.ArgumentParser()
+    p.add_argument("--skip-scrape", action="store_true")
+    p.add_argument("--mode", choices=["both",
+                   "arriendo", "venta"], default="both")
+    p.add_argument("--fast", action="store_true",
+                   help="20 Optuna trials (dev mode)")
+    a = p.parse_args()
+    run_pipeline(skip_scrape=a.skip_scrape, mode=a.mode, fast=a.fast)

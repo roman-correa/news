@@ -1,10 +1,5 @@
-import xgboost
-import sklearn
-import skopt
-import pandas
-import numpy
-print('xgboost:', xgboost.__version__)
-print('sklearn:', sklearn.__version__)
-print('skopt:', skopt.__version__)
-print('pandas:', pandas.__version__)
-print('numpy:', numpy.__version__)
+import lightgbm; print('lightgbm OK', lightgbm.__version__)
+import catboost; print('catboost OK', catboost.__version__)
+import optuna; print('optuna OK', optuna.__version__)
+import mlflow; print('mlflow OK', mlflow.__version__)
+import geopy; print('geopy OK', geopy.__version__)
