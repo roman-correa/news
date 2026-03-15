@@ -3,7 +3,6 @@ Compra/Venta Medellín — Real Estate Price Predictor
 Author: Roman Alejandro Correa
 """
 from sklearn.model_selection import KFold
-from catboost import CatBoostRegressor
 from lightgbm import LGBMRegressor
 from xgboost import XGBRegressor
 from sklearn.linear_model import Ridge
@@ -194,17 +193,19 @@ html, body, [class*="css"] {
 
 
 class StackedEnsemble:
-    """XGBoost + LightGBM + CatBoost → Ridge meta-learner."""
+    """XGBoost + LightGBM → Ridge meta-learner."""
 
     def __init__(self, xgb_p=None, lgb_p=None, cat_p=None):
+        # cat_p kept for backward compat with old pickles — ignored
         self.xgb_p = xgb_p or {}
         self.lgb_p = lgb_p or {}
-        self.cat_p = cat_p or {}
         self.base_ = []
         self.meta_ = None
 
     def predict(self, X) -> np.ndarray:
-        X = X.replace([np.inf, -np.inf], np.nan).fillna(X.median())
+        X = X.replace([np.inf, -np.inf], np.nan)
+        medians = X.median().fillna(0)
+        X = X.fillna(medians)
         return self.meta_.predict(
             np.column_stack([m.predict(X) for m in self.base_])
         )
@@ -1005,24 +1006,50 @@ elif mode == "🗺️ Mapa de oportunidades":
     opp = opp[(opp["precio"] >= min_price) & (opp["precio"] <= max_price)]
     opp_with_coords = opp.reset_index(drop=True)
 
-    show_cols = [c for c in ["nombre", "tipo", "precio", "cat_pred", "pct_underpriced",
-                             "area", "habitaciones", "baños", "parqueaderos", "url"] if c in opp.columns]
+    # ── Build display table — pricing + opportunity signal only ─────────────
+    # Compute nearest metro distance if not already in the dataframe
+    if "dist_metro_km" not in opp.columns and "latitud" in opp.columns:
+        metro_stations = None
+        try:
+            metro_stations = load_pickle(_artifact("metro_stations.pkl"))
+        except Exception:
+            pass
+        if metro_stations:
+            import numpy as _np2
+            sta = _np2.array([(s[1], s[2]) for s in metro_stations])
+            props = opp[["latitud", "longitud"]].values
+            lat_m = props[:, 0].mean()
+            scale = _np2.array([111.0, 111.0 * _np2.cos(_np2.radians(lat_m))])
+            diffs = props[:, _np2.newaxis, :] - sta[_np2.newaxis, :, :]
+            opp = opp.copy()
+            opp["dist_metro_km"] = _np2.sqrt(
+                ((diffs * scale) ** 2).sum(axis=2)).min(axis=1)
+
+    show_cols = [c for c in ["nombre", "tipo", "precio", "cat_pred",
+                             "pct_underpriced", "dist_metro_km", "url"] if c in opp.columns]
     opp_display = opp[show_cols].copy()
-    if "precio" in opp_display.columns:
-        opp_display["precio"] = opp_display["precio"].apply(fmt_price)
+    opp_display["precio"] = opp_display["precio"].apply(fmt_price)
     if "cat_pred" in opp_display.columns:
         opp_display["cat_pred"] = opp_display["cat_pred"].apply(fmt_price)
     if "pct_underpriced" in opp_display.columns:
         opp_display["pct_underpriced"] = opp_display["pct_underpriced"].apply(
             lambda x: f"{x:.1f}%")
+    if "dist_metro_km" in opp_display.columns:
+        opp_display["dist_metro_km"] = opp_display["dist_metro_km"].apply(
+            lambda x: f"{x:.2f} km" if pd.notna(x) else "—")
+    if "tipo" in opp_display.columns:
+        opp_display["tipo"] = opp_display["tipo"].str.title()
+
     opp_display = opp_display.rename(columns={
-        "nombre": "Barrio", "tipo": "Tipo", "precio": "Precio real",
-        "cat_pred": "Precio modelo", "pct_underpriced": "Descuento",
-        "area": "m²", "habitaciones": "Hab", "baños": "Baños",
-        "parqueaderos": "Parq", "url": "Link",
+        "nombre":        "Barrio",
+        "tipo":          "Tipo",
+        "precio":        "Precio real",
+        "cat_pred":      "Precio modelo",
+        "pct_underpriced": "Descuento",
+        "dist_metro_km": "Dist. metro",
+        "url":           "Link",
     })
-    if "Tipo" in opp_display.columns:
-        opp_display["Tipo"] = opp_display["Tipo"].str.title()
+
     col_cfg = {}
     if "Link" in opp_display.columns:
         col_cfg["Link"] = st.column_config.LinkColumn(

@@ -3,7 +3,7 @@ Medellín Real Estate — Training Pipeline  v2
 ============================================
 Scrapes metrocuadrado.com + Fincaraíz, cleans data, engineers features
 (including estrato, metro distance, amenities), trains a stacked ensemble
-(XGBoost + LightGBM + CatBoost → Ridge meta-learner), produces quantile
+(XGBoost + LightGBM → Ridge meta-learner), produces quantile
 predictions for confidence intervals, and logs everything to MLflow.
 
 Usage:
@@ -43,7 +43,6 @@ import pandas as pd
 import requests
 from geopy.distance import geodesic
 from lightgbm import LGBMRegressor
-from catboost import CatBoostRegressor
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, r2_score
@@ -66,33 +65,66 @@ MEDELLIN_BOUNDS = dict(lat_min=6.175, lat_max=6.28,
 
 # Metro de Medellín + Tranvía + Cables stations (name, lat, lon)
 METRO_STATIONS = [
-    ("Niquía",          6.338056, -75.536389),
-    ("Bello",           6.326667, -75.536944),
-    ("Madera",          6.315278, -75.540556),
-    ("Acevedo",         6.298889, -75.545278),
-    ("Tricentenario",   6.291111, -75.546944),
-    ("Caribe",          6.279167, -75.551389),
-    ("Universidad",     6.267778, -75.567222),
-    ("Hospital",        6.261389, -75.573333),
-    ("Prado",           6.257222, -75.572778),
-    ("Parque Berrío",   6.251389, -75.568611),
-    ("San Antonio",     6.247500, -75.569167),
-    ("Alpujarra",       6.245278, -75.572500),
-    ("Exposiciones",    6.241667, -75.573889),
-    ("Industriales",    6.236111, -75.574444),
-    ("Poblado",         6.210556, -75.574167),
-    ("Aguacatala",      6.199722, -75.573889),
-    ("Ayurá",           6.185556, -75.574722),
-    ("Envigado",        6.175278, -75.583889),
-    ("San Javier",      6.247222, -75.598333),
-    ("Floresta",        6.248056, -75.602222),
-    ("Santa Lucía",     6.248889, -75.609167),
-    ("El Pedregal",     6.249722, -75.614722),
-    ("La Mota",         6.250000, -75.620278),
-    ("Aranjuez",        6.281667, -75.555556),
-    ("Andalucía",       6.286944, -75.550278),
-    ("Villa Sierra",    6.294167, -75.543611),
-    ("Santo Domingo",   6.302222, -75.538889),
+    # ── Línea A (Norte–Sur) ──────────────────────────────────────────────────
+    ("Niquía",          6.337835, -75.544243),
+    ("Bello",           6.331311, -75.553863),
+    ("Madera",          6.314587, -75.556448),
+    ("Acevedo",         6.299855, -75.558723),
+    ("Tricentenario",   6.290446, -75.564635),
+    ("Caribe",          6.277508, -75.569627),
+    ("Universidad",     6.269388, -75.565751),
+    ("Hospital",        6.263641, -75.563040),
+    ("Prado",           6.257147, -75.566022),
+    ("Parque Berrío",   6.250263, -75.568346),
+    ("San Antonio",     6.247250, -75.569820),
+    ("Alpujarra",       6.242903, -75.571435),
+    ("Exposiciones",    6.238360, -75.573194),
+    ("Industriales",    6.229936, -75.575619),
+    ("Poblado",         6.212808, -75.577940),
+    ("Aguacatala",      6.194682, -75.581489),
+    ("Ayurá",           6.186526, -75.585438),
+    ("Envigado",        6.174663, -75.597085),
+    # ── Línea B (Este–Oeste) ──────────────────────────────────────────────────
+    ("San Antonio",     6.247250, -75.569820),   # interchange with A
+    ("Estadio",         6.253403, -75.588282),
+    ("Floresta",        6.258659, -75.597768),
+    ("Santa Lucía",     6.258074, -75.603771),
+    ("El Pedregal",     6.253611, -75.612500),
+    ("La Mota",         6.251667, -75.621389),
+    ("San Javier",      6.256991, -75.611983),
+    # ── Cable K (Acevedo → Santo Domingo) ────────────────────────────────────
+    ("Aranjuez",        6.299855, -75.558723),
+    ("Andalucía",       6.296078, -75.551899),
+    ("Villa Sierra",    6.302222, -75.538889),
+    ("Santo Domingo",   6.293074, -75.541733),
+    # ── Cable J (San Javier → La Aurora) ─────────────────────────────────────
+    ("Juan XXIII",      6.265754, -75.613220),
+    ("Vallejuelos",     6.275257, -75.613954),
+    ("La Aurora",       6.281110, -75.614273),
+    # ── Cable H (Oriente / Villatina) ─────────────────────────────────────────
+    ("Oriente",         6.233412, -75.540451),
+    ("Las Torres",      6.240000, -75.536000),
+    ("Villa Turbay",    6.234792, -75.528723),
+    # ── Metroplus Línea 1 (Aranjuez ↔ Industriales) ─────────────────────────
+    # interchange with Metro Línea A
+    ("MP Hospital",     6.263983, -75.563739),
+    ("MP Manrique",     6.273098, -75.554139),
+    ("MP Berlín",       6.282740, -75.552921),
+    ("MP Esmeraldas",   6.278376, -75.553135),
+    ("MP Cisneros",     6.250405, -75.575069),
+    # interchange with Metro Línea A
+    ("MP Industriales", 6.230658, -75.576619),
+    # ── Metroplus Línea 2 (U de Medellín ↔ Industriales via Calle 30) ────────
+    ("MP U Medellín",   6.230695, -75.609251),
+    ("MP Rosales",      6.231563, -75.590940),
+    ("MP Fátima",       6.231685, -75.586590),
+    # ── Tranvía de Ayacucho ───────────────────────────────────────────────────
+    ("San José",        6.247313, -75.565341),
+    ("Bicentenario",    6.243922, -75.558735),
+    ("Buenos Aires",    6.241217, -75.553565),
+    ("Miraflores",      6.241385, -75.548996),
+    ("Loyola",          6.239032, -75.545163),
+    ("Alejandro E.",    6.235535, -75.541716),
 ]
 
 NUM_ATTRIBS = [
@@ -403,7 +435,13 @@ def _xgb_obj(trial, X, y):
         reg_lambda=trial.suggest_float("reg_lambda", 0.5, 8.0, log=True),
         random_state=42, verbosity=0, n_jobs=-1,
     )
-    return cross_val_score(XGBRegressor(**p), _safe_X(X), y, cv=5, scoring="r2").mean()
+    try:
+        scores = cross_val_score(XGBRegressor(**p), _safe_X(X), y,
+                                 cv=5, scoring="r2", error_score="raise")
+        result = float(np.nan_to_num(scores, nan=-1.0).mean())
+        return result if np.isfinite(result) else -1.0
+    except Exception:
+        return -1.0
 
 
 def _lgb_obj(trial, X, y):
@@ -420,30 +458,26 @@ def _lgb_obj(trial, X, y):
         reg_lambda=trial.suggest_float("reg_lambda", 0.5, 8.0, log=True),
         random_state=42, verbose=-1, n_jobs=-1,
     )
-    return cross_val_score(LGBMRegressor(**p), _safe_X(X), y, cv=5, scoring="r2").mean()
+    try:
+        scores = cross_val_score(LGBMRegressor(**p), _safe_X(X), y,
+                                 cv=5, scoring="r2", error_score="raise")
+        result = float(np.nan_to_num(scores, nan=-1.0).mean())
+        return result if np.isfinite(result) else -1.0
+    except Exception:
+        return -1.0
 
 
 def _safe_X(X: pd.DataFrame) -> pd.DataFrame:
-    """Replace inf/nan with column medians — applied before every model fit."""
+    """Replace inf/nan with column medians, then 0 for all-NaN columns."""
     X = X.replace([np.inf, -np.inf], np.nan)
-    return X.fillna(X.median())
-
-
-def _cat_obj(trial, X, y):
-    p = dict(
-        iterations=trial.suggest_int("iterations", 300, 1000),
-        learning_rate=trial.suggest_float(
-            "learning_rate", 0.01, 0.15, log=True),
-        depth=trial.suggest_int("depth", 4, 8),
-        l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 1.0, 10.0, log=True),
-        random_seed=42, verbose=0,
-    )
-    return cross_val_score(CatBoostRegressor(**p), _safe_X(X), y, cv=5, scoring="r2").mean()
+    medians = X.median()
+    medians = medians.fillna(0)   # columns that are entirely NaN get 0
+    return X.fillna(medians)
 
 
 def tune(X: pd.DataFrame, y: pd.Series, n_trials: int = 50) -> dict:
     best = {}
-    for name, obj in [("xgb", _xgb_obj), ("lgb", _lgb_obj), ("cat", _cat_obj)]:
+    for name, obj in [("xgb", _xgb_obj), ("lgb", _lgb_obj)]:
         print(f"  Tuning {name} ({n_trials} trials)...")
         study = optuna.create_study(direction="maximize",
                                     sampler=optuna.samplers.TPESampler(seed=42))
@@ -460,12 +494,12 @@ def tune(X: pd.DataFrame, y: pd.Series, n_trials: int = 50) -> dict:
 
 class StackedEnsemble:
     """
-    Level-0 : XGBoost + LightGBM + CatBoost  (OOF predictions, 5-fold CV)
+    Level-0 : XGBoost + LightGBM  (OOF predictions, 5-fold CV)
     Level-1 : Ridge meta-learner
     """
 
-    def __init__(self, xgb_p: dict, lgb_p: dict, cat_p: dict):
-        self.xgb_p, self.lgb_p, self.cat_p = xgb_p, lgb_p, cat_p
+    def __init__(self, xgb_p: dict, lgb_p: dict):
+        self.xgb_p, self.lgb_p = xgb_p, lgb_p
         self.base_: list = []
         self.meta_: Ridge | None = None
 
@@ -475,16 +509,15 @@ class StackedEnsemble:
                 **self.xgb_p, random_state=42, verbosity=0, n_jobs=-1),
             lambda: LGBMRegressor(
                 **self.lgb_p, random_state=42, verbose=-1,  n_jobs=-1),
-            lambda: CatBoostRegressor(**self.cat_p, random_seed=42, verbose=0),
         ]
 
     def fit(self, X: pd.DataFrame, y: pd.Series, cv: int = 5) -> "StackedEnsemble":
         kf = KFold(n_splits=cv, shuffle=True, random_state=42)
-        oof = np.zeros((len(X), 3))
+        oof = np.zeros((len(X), 2))
 
         print("  Training stacked ensemble (5-fold OOF)...")
         for mi, factory in enumerate(self._factories()):
-            name = ["XGB", "LGB", "CAT"][mi]
+            name = ["XGB", "LGB"][mi]
             fold_r2 = []
             for tr_i, va_i in kf.split(X):
                 m = factory()
@@ -502,7 +535,7 @@ class StackedEnsemble:
         print(
             f"    Ensemble OOF R²: {r2_score(y, self.meta_.predict(oof)):.4f}")
         print(f"    Weights — XGB:{self.meta_.coef_[0]:.3f}  "
-              f"LGB:{self.meta_.coef_[1]:.3f}  CAT:{self.meta_.coef_[2]:.3f}")
+              f"LGB:{self.meta_.coef_[1]:.3f}")
         return self
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
@@ -687,7 +720,7 @@ def run_pipeline(skip_scrape: bool = False, mode: str = "both", fast: bool = Fal
 
         if mode in ("both", "arriendo"):
             stack_arr = StackedEnsemble(
-                best_arr["xgb"], best_arr["lgb"], best_arr["cat"]
+                best_arr["xgb"], best_arr["lgb"]
             ).fit(X_tr_arr, y_tr_arr)
             q10_arr, q90_arr = train_quantile_models(
                 X_tr_arr, y_tr_arr, X_te_arr, y_te_arr, "Arriendo")
@@ -696,7 +729,7 @@ def run_pipeline(skip_scrape: bool = False, mode: str = "both", fast: bool = Fal
 
         if mode in ("both", "venta"):
             stack_ven = StackedEnsemble(
-                best_ven["xgb"], best_ven["lgb"], best_ven["cat"]
+                best_ven["xgb"], best_ven["lgb"]
             ).fit(X_tr_ven, y_tr_ven)
             q10_ven, q90_ven = train_quantile_models(
                 X_tr_ven, y_tr_ven, X_te_ven, y_te_ven, "Venta")
