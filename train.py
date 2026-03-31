@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import pickle
+import re
 import time
 import unicodedata
 import warnings
@@ -60,8 +61,12 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 ARTIFACTS_DIR = Path("artifacts")
 ARTIFACTS_DIR.mkdir(exist_ok=True)
 
-MEDELLIN_BOUNDS = dict(lat_min=6.175, lat_max=6.28,
-                       lon_min=-75.62, lon_max=-75.55)
+MEDELLIN_BOUNDS = dict(lat_min=6.10, lat_max=6.40,
+                       lon_min=-75.70, lon_max=-75.45)
+
+# Buffer (degrees) around each neighborhood's observed bbox for
+# name ↔ coordinate validation (~550 m at this latitude)
+LOCATION_BBOX_BUFFER = 0.005
 
 # Metro de Medellín + Tranvía + Cables stations (name, lat, lon)
 METRO_STATIONS = [
@@ -272,6 +277,58 @@ def fix_coordinates(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def _norm(s: str) -> str:
+    """Lowercase + strip accents + collapse whitespace — used for name matching."""
+    s = str(s).lower().strip()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def validate_location_match(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop rows where the property's coordinates fall outside the bounding box
+    of its assigned neighborhood (nombre).
+
+    Strategy
+    --------
+    1. Build a per-neighborhood bbox from the dataset itself — the spatial join
+       in clean() already assigned the official nombre from the shapefile, so
+       the bbox reflects the true geographic extent of each barrio.
+    2. Add a small buffer (LOCATION_BBOX_BUFFER degrees, ~550 m) to avoid
+       rejecting legitimate edge properties.
+    3. Properties whose nombre is not in the reference (shouldn't happen after
+       sjoin, but just in case) are kept.
+    """
+    before = len(df)
+
+    bbox = (
+        df.groupby("nombre")
+        .agg(lat_min=("latitud", "min"), lat_max=("latitud", "max"),
+             lon_min=("longitud", "min"), lon_max=("longitud", "max"))
+        .reset_index()
+    )
+    bbox["lat_min"] -= LOCATION_BBOX_BUFFER
+    bbox["lat_max"] += LOCATION_BBOX_BUFFER
+    bbox["lon_min"] -= LOCATION_BBOX_BUFFER
+    bbox["lon_max"] += LOCATION_BBOX_BUFFER
+    bbox_dict = bbox.set_index("nombre").to_dict("index")
+
+    def _ok(row):
+        b = bbox_dict.get(row["nombre"])
+        if b is None:
+            return True  # unknown nombre — keep
+        return (b["lat_min"] <= row["latitud"] <= b["lat_max"] and
+                b["lon_min"] <= row["longitud"] <= b["lon_max"])
+
+    mask = df.apply(_ok, axis=1)
+    dropped = before - mask.sum()
+    print(f"    validate_location_match: dropped {dropped} rows "
+          f"(name↔coordinate mismatch)")
+    return df[mask].reset_index(drop=True)
+
+
 def clean(df: pd.DataFrame, geo: gpd.GeoDataFrame, operacion: str) -> pd.DataFrame:
     print(f"  Cleaning {operacion}: {len(df)} rows...")
 
@@ -306,6 +363,9 @@ def clean(df: pd.DataFrame, geo: gpd.GeoDataFrame, operacion: str) -> pd.DataFra
     df = pd.DataFrame(joined).reset_index(drop=True)
     df["nombre"] = df["nombre"].astype(str).apply(clean_nombre)
     df = df[~df["nombre"].str.lower().isin(["nan", "none", ""])]
+
+    # Drop properties whose coordinates don't match their assigned neighborhood
+    df = validate_location_match(df)
 
     # Fill missing estrato with barrio median, then global median
     e_med = df.groupby("nombre")["estrato"].median()
