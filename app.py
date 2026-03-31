@@ -659,51 +659,265 @@ def fetch_pois(lat: float, lon: float, radius_m: int = 800) -> dict[str, pd.Data
 
 
 # ─────────────────────────────────────────────
+# Language support
+# ─────────────────────────────────────────────
+if "lang" not in st.session_state:
+    st.session_state.lang = "es"
+
+TRANSLATIONS = {
+    "es": {
+        "title": "🏙️ Medellín RE",
+        "nav": "Navegación",
+        "nav_predictor": "🔮 Predictor",
+        "nav_explore": "📊 Explorar datos",
+        "nav_map": "🗺️ Mapa de oportunidades",
+        "filters": "Filtros globales",
+        "barrio": "Barrio",
+        "min_price": "Precio mínimo (COP)",
+        "max_price": "Precio máximo (COP)",
+        "model_status": "Estado del modelo",
+        "data_updated": "Datos actualizados",
+        "by": "Por Roman Alejandro Correa",
+        "predictor_title": "Predictor de precios",
+        "predictor_desc": "Estima el precio de arriendo o venta de una propiedad en Medellín.",
+        "transaction_type": "Tipo de transacción",
+        "rental": "Arriendo",
+        "sale": "Venta",
+        "model_accuracy": "Precisión del modelo",
+        "excellent": "Excelente",
+        "good": "Bueno",
+        "moderate": "Moderado",
+        "property_data": "Datos de la propiedad",
+        "area": "Área (m²)",
+        "bedrooms": "Habitaciones",
+        "bathrooms": "Baños",
+        "parking": "Parqueaderos",
+        "strata": "Estrato",
+        "admin_fee": "Admon. mensual (COP)",
+        "metro_distance": "Dist. metro aprox. (km)",
+        "predict_btn": "Predecir precio →",
+        "result": "Resultado",
+        "estimado": "Precio estimado",
+        "probable_range": "Rango probable",
+        "price_m2": "Precio / m²",
+        "your_property": "Tu propiedad",
+        "median_barrio_m2": "Mediana barrio / m²",
+        "key_factors": "Factores clave del precio",
+        "similar_props": "Propiedades similares en el barrio",
+        "no_comparables": "No hay comparables con filtros exactos en este barrio.",
+        "fill_form": "Completa el formulario y presiona",
+        "barrio_context": "Contexto del barrio seleccionado",
+        "median_rental": "Arriendo — mediana",
+        "median_sale": "Venta — mediana",
+        "listings": "listings",
+        "explorer_title": "Explorador de datos",
+        "dataset": "Dataset",
+        "total_listings": "Total listings",
+        "filtered": "filtrados",
+        "price_median": "Precio mediana",
+        "area_median": "Área mediana",
+        "opportunities": "Oportunidades",
+        "underpriced": ">20% subvaloradas",
+        "visualizations": "Visualizaciones",
+        "price_distribution": "Distribución de precios",
+        "price_vs_area": "Precio vs Área",
+        "by_barrio": "Por barrio",
+        "top_barrios": "Top 25 barrios por precio mediano",
+        "data_table": "Tabla de datos",
+        "download_csv": "⬇ Descargar CSV filtrado",
+        "map_title": "Mapa de oportunidades",
+        "map_desc": "Barrios y propiedades donde el precio de mercado está por debajo del valor predicho por el modelo.",
+        "view": "Ver",
+        "found": "encontradas",
+        "poi_nearby": "Puntos de interés cercanos",
+        "show_on_map": "Mostrar en el mapa",
+        "categories": "Categorías",
+        "searching_poi": "Buscando puntos de interés...",
+        "no_coords": "Sin coordenadas disponibles.",
+        "select_row": "Selecciona una fila para ver la propiedad y sus POIs.",
+        "real_vs_estimated": "Precio real vs. precio estimado por el modelo",
+        "fair_price": "Precio justo",
+        "download_opportunities": "⬇ Descargar oportunidades",
+        "disclaimer_title": "⚠️ Sobre las discrepancias de barrio",
+        "disclaimer_text": """
+        <div style='background:#1a2d3f;border:1px solid #0fd4c0;border-radius:8px;padding:16px;margin:16px 0;color:#a0c0dc;font-size:13px;line-height:1.6;'>
+        <p><strong style='color:#0fd4c0'>Importante:</strong> Este modelo utiliza coordenadas GPS exactas de las propiedades para hacer predicciones. Sin embargo, el barrio mostrado en la descripción de metrocuadrado a veces <strong>no coincide con la ubicación real</strong> de la propiedad.</p>
+        <p style='margin-top:10px;'>Esto ocurre porque:</p>
+        <ul style='margin-left:20px;margin-top:8px;'>
+        <li><strong>Errores de descripción:</strong> Algunos vendedores ingresan un barrio incorrecto en el anuncio.</li>
+        <li><strong>Límites de barrios difusos:</strong> Las propiedades en los límites pueden estar registradas en un barrio pero ubicarse físicamente en otro.</li>
+        <li><strong>Nombres alternativos:</strong> Barrios con múltiples nombres (ej: "La Candelaria" vs "Las Palmas").</li>
+        </ul>
+        <p style='margin-top:10px;'><strong>¿Cómo usamos esto?</strong> El modelo se basa en las <strong>coordenadas reales (GPS)</strong>, no en la descripción del vendedor. Por lo tanto, si ves que el barrio predicho es diferente, confía en la ubicación GPS — es más preciso.</p>
+        </div>
+        """,
+    },
+    "en": {
+        "title": "🏙️ Medellín RE",
+        "nav": "Navigation",
+        "nav_predictor": "🔮 Price Predictor",
+        "nav_explore": "📊 Explore Data",
+        "nav_map": "🗺️ Opportunity Map",
+        "filters": "Global Filters",
+        "barrio": "Neighborhood",
+        "min_price": "Minimum Price (COP)",
+        "max_price": "Maximum Price (COP)",
+        "model_status": "Model Status",
+        "data_updated": "Data Updated",
+        "by": "By Roman Alejandro Correa",
+        "predictor_title": "Price Predictor",
+        "predictor_desc": "Estimate the rental or sale price of a property in Medellín.",
+        "transaction_type": "Transaction Type",
+        "rental": "Rental",
+        "sale": "Sale",
+        "model_accuracy": "Model Accuracy",
+        "excellent": "Excellent",
+        "good": "Good",
+        "moderate": "Moderate",
+        "property_data": "Property Data",
+        "area": "Area (m²)",
+        "bedrooms": "Bedrooms",
+        "bathrooms": "Bathrooms",
+        "parking": "Parking Spaces",
+        "strata": "Strata",
+        "admin_fee": "Monthly Admin Fee (COP)",
+        "metro_distance": "Approx. Metro Distance (km)",
+        "predict_btn": "Predict Price →",
+        "result": "Result",
+        "estimado": "Estimated Price",
+        "probable_range": "Probable Range",
+        "price_m2": "Price / m²",
+        "your_property": "Your Property",
+        "median_barrio_m2": "Neighborhood Median / m²",
+        "key_factors": "Key Price Factors",
+        "similar_props": "Similar Properties in the Neighborhood",
+        "no_comparables": "No comparables found with exact filters in this neighborhood.",
+        "fill_form": "Complete the form and press",
+        "barrio_context": "Selected Neighborhood Context",
+        "median_rental": "Rental — Median",
+        "median_sale": "Sale — Median",
+        "listings": "listings",
+        "explorer_title": "Data Explorer",
+        "dataset": "Dataset",
+        "total_listings": "Total Listings",
+        "filtered": "filtered",
+        "price_median": "Median Price",
+        "area_median": "Median Area",
+        "opportunities": "Opportunities",
+        "underpriced": ">20% underpriced",
+        "visualizations": "Visualizations",
+        "price_distribution": "Price Distribution",
+        "price_vs_area": "Price vs Area",
+        "by_barrio": "By Neighborhood",
+        "top_barrios": "Top 25 Neighborhoods by Median Price",
+        "data_table": "Data Table",
+        "download_csv": "⬇ Download Filtered CSV",
+        "map_title": "Opportunity Map",
+        "map_desc": "Neighborhoods and properties where the market price is below the value predicted by the model.",
+        "view": "View",
+        "found": "found",
+        "poi_nearby": "Nearby Points of Interest",
+        "show_on_map": "Show on Map",
+        "categories": "Categories",
+        "searching_poi": "Searching for points of interest...",
+        "no_coords": "No coordinates available.",
+        "select_row": "Select a row to see the property and its POIs.",
+        "real_vs_estimated": "Real Price vs Model Estimated Price",
+        "fair_price": "Fair Price",
+        "download_opportunities": "⬇ Download Opportunities",
+        "disclaimer_title": "⚠️ About Neighborhood Discrepancies",
+        "disclaimer_text": """
+        <div style='background:#1a2d3f;border:1px solid #0fd4c0;border-radius:8px;padding:16px;margin:16px 0;color:#a0c0dc;font-size:13px;line-height:1.6;'>
+        <p><strong style='color:#0fd4c0'>Important:</strong> This model uses exact GPS coordinates of properties to make predictions. However, the neighborhood shown in the metrocuadrado listing sometimes <strong>does not match the actual property location</strong>.</p>
+        <p style='margin-top:10px;'>This happens because:</p>
+        <ul style='margin-left:20px;margin-top:8px;'>
+        <li><strong>Description Errors:</strong> Some sellers enter an incorrect neighborhood in the listing.</li>
+        <li><strong>Fuzzy Boundaries:</strong> Properties on neighborhood borders may be registered in one area but physically located in another.</li>
+        <li><strong>Alternative Names:</strong> Neighborhoods with multiple names (e.g., "La Candelaria" vs "Las Palmas").</li>
+        </ul>
+        <p style='margin-top:10px;'><strong>How We Handle This:</strong> The model is based on <strong>real GPS coordinates</strong>, not the seller's description. Therefore, if you see that the predicted neighborhood differs, trust the GPS location — it's more accurate.</p>
+        </div>
+        """,
+    }
+}
+
+
+def t(key: str) -> str:
+    """Translate a key using the current language."""
+    return TRANSLATIONS[st.session_state.lang].get(key, key)
+
+
+# ─────────────────────────────────────────────
+# Language toggle in top right
+# ─────────────────────────────────────────────
+col_spacer, col_lang = st.columns([5, 1])
+with col_lang:
+    lang_cols = st.columns(2)
+    with lang_cols[0]:
+        if st.button("🇪🇸 ES", use_container_width=True,
+                     type="primary" if st.session_state.lang == "es" else "secondary"):
+            st.session_state.lang = "es"
+            st.rerun()
+    with lang_cols[1]:
+        if st.button("🇬🇧 EN", use_container_width=True,
+                     type="primary" if st.session_state.lang == "en" else "secondary"):
+            st.session_state.lang = "en"
+            st.rerun()
+
+
+# ─────────────────────────────────────────────
 # Sidebar
 # ─────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### 🏙️ Medellín RE")
-    st.markdown("<div class='section-header'>Navegación</div>",
+    st.markdown(f"### {t('title')}")
+    st.markdown(f"<div class='section-header'>{t('nav')}</div>",
                 unsafe_allow_html=True)
+
+    mode_options = [t('nav_predictor'), t('nav_explore'), t('nav_map')]
     mode = st.radio(
         "Sección",
-        ["🔮 Predictor", "📊 Explorar datos", "🗺️ Mapa de oportunidades"],
+        mode_options,
         label_visibility="collapsed",
     )
 
-    st.markdown("<div class='section-header'>Filtros globales</div>",
+    st.markdown(f"<div class='section-header'>{t('filters')}</div>",
                 unsafe_allow_html=True)
-    selected_barrio = st.selectbox("Barrio", ["Todos"] + sorted(list_barrios))
+    selected_barrio = st.selectbox(
+        t('barrio'), ["Todos"] + sorted(list_barrios))
     min_price = st.number_input(
-        "Precio mínimo (COP)", value=0, step=1_000_000, format="%d")
+        t('min_price'), value=0, step=1_000_000, format="%d")
     max_price = st.number_input(
-        "Precio máximo (COP)", value=2_000_000_000, step=1_000_000, format="%d")
+        t('max_price'), value=2_000_000_000, step=1_000_000, format="%d")
 
     st.markdown("---")
-    st.markdown("<div class='section-header'>Estado del modelo</div>",
+    st.markdown(f"<div class='section-header'>{t('model_status')}</div>",
                 unsafe_allow_html=True)
     st.markdown(
         f"""<div style='font-size:12px;color:#5f8ab0;line-height:2;'>
-            📅 <b style='color:#8aabcc'>Datos actualizados</b><br>
+            📅 <b style='color:#8aabcc'>{t('data_updated')}</b><br>
             <span style='font-family:"DM Mono",monospace;color:#0fd4c0'>{DATA_DATE}</span><br><br>
-            📐 <b style='color:#8aabcc'>R² Arriendo</b><br>
+            📐 <b style='color:#8aabcc'>R² {t('rental')}</b><br>
             <span style='font-family:"DM Mono",monospace;color:#0fd4c0'>{MODEL_R2.get("arr", float("nan")):.4f}</span><br><br>
-            📐 <b style='color:#8aabcc'>R² Venta</b><br>
+            📐 <b style='color:#8aabcc'>R² {t('sale')}</b><br>
             <span style='font-family:"DM Mono",monospace;color:#0fd4c0'>{MODEL_R2.get("ven", float("nan")):.4f}</span>
         </div>""",
         unsafe_allow_html=True,
     )
     st.markdown("---")
-    st.caption("Por Roman Alejandro Correa")
+    st.caption(t('by'))
 
 
 # ─────────────────────────────────────────────
 # PAGE: PREDICTOR
 # ─────────────────────────────────────────────
-if mode == "🔮 Predictor":
-    st.markdown("## Predictor de precios")
-    st.markdown(
-        "Estima el precio de arriendo o venta de una propiedad en Medellín.")
+if mode == t('nav_predictor'):
+    st.markdown(f"## {t('predictor_title')}")
+    st.markdown(t('predictor_desc'))
+
+    # Disclaimer about neighborhood discrepancies
+    st.markdown(f"### {t('disclaimer_title')}")
+    st.markdown(t('disclaimer_text'), unsafe_allow_html=True)
+    st.markdown("---")
 
     kind_label = st.segmented_control(
         "Tipo de transacción", ["Arriendo", "Venta"], default="Arriendo")
@@ -874,7 +1088,7 @@ if mode == "🔮 Predictor":
 # ─────────────────────────────────────────────
 # PAGE: EXPLORAR DATOS
 # ─────────────────────────────────────────────
-elif mode == "📊 Explorar datos":
+elif mode == t('nav_explore'):
     st.markdown("## Explorador de datos")
 
     ds_choice = st.segmented_control(
@@ -990,7 +1204,7 @@ elif mode == "📊 Explorar datos":
 # ─────────────────────────────────────────────
 # PAGE: MAPA DE OPORTUNIDADES
 # ─────────────────────────────────────────────
-elif mode == "🗺️ Mapa de oportunidades":
+elif mode == t('nav_map'):
     st.markdown("## Mapa de oportunidades")
     st.markdown(
         "Barrios y propiedades donde el precio de mercado está por debajo del valor predicho por el modelo.")

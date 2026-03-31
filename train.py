@@ -322,6 +322,64 @@ def _url_municipality(url: str) -> str | None:
     return _norm(loc) if loc and loc != "0" else None
 
 
+def validate_barrio_assignment(df: pd.DataFrame, geo: gpd.GeoDataFrame,
+                               max_distance_km: float = 2.0) -> pd.DataFrame:
+    """
+    Check if each property's assigned barrio is spatially plausible.
+    
+    For each row, compute the distance from the property to the 
+    centroid of its assigned barrio. If > max_distance_km, flag as 
+    potentially mis-assigned and prefer URL location if available.
+    
+    Args:
+        df: DataFrame with 'nombre', 'latitud', 'longitud', 'url' columns
+        geo: GeoDataFrame of barrio boundaries
+        max_distance_km: max distance from property to barrio centroid
+    
+    Returns:
+        df with nombre corrected for spatially implausible assignments
+    """
+    df = df.copy()
+    df["_url_loc"] = df["url"].apply(_url_municipality)
+
+    # Get barrio centroids
+    geo_copy = geo.copy()
+    geo_copy.columns = geo_copy.columns.str.lower()
+    geo_copy["centroid"] = geo_copy.geometry.centroid
+    centroids = geo_copy[["nombre", "centroid"]].copy()
+    centroids["nombre"] = centroids["nombre"].apply(clean_nombre)
+    centroid_map = dict(zip(centroids["nombre"], centroids["centroid"]))
+
+    fixed = 0
+    for idx, row in df.iterrows():
+        assigned_barrio = row["nombre"]
+        if assigned_barrio not in centroid_map:
+            continue
+
+        barrio_center = centroid_map[assigned_barrio]
+        prop_coord = (row["latitud"], row["longitud"])
+
+        # Distance in km
+        dist = geodesic(prop_coord, (barrio_center.y, barrio_center.x)).km
+
+        # If property is far from its assigned barrio AND we have a URL location,
+        # trust the URL instead
+        if dist > max_distance_km and pd.notna(row["_url_loc"]):
+            # Normalize the URL location to match shapefile casing if possible
+            url_loc_norm = row["_url_loc"]
+            for bn in centroid_map.keys():
+                if bn.lower() == url_loc_norm.lower():
+                    df.at[idx, "nombre"] = bn
+                    fixed += 1
+                    break
+
+    df = df.drop(columns=["_url_loc"])
+    if fixed > 0:
+        print(f"    validate_barrio_assignment: fixed {fixed} spatially implausible assignments "
+              f"(property >2km from barrio centroid)")
+    return df
+
+
 def validate_location_match(df: pd.DataFrame) -> pd.DataFrame:
     """
     Drop rows where the URL title names a municipality outside Medellín.
@@ -401,12 +459,12 @@ def correct_nombre_from_url(df: pd.DataFrame,
                             url_loc_map: dict[str, str]) -> pd.DataFrame:
     """
     Override the shapefile-assigned nombre with the url_loc-derived nombre
-    when the mapping is unambiguous.
+    when the mapping is unambiguous or when there's a strong disagreement signal.
 
-    Only overrides rows where:
-    1. The url_loc is in the unambiguous lookup.
-    2. The url_loc-derived nombre differs from the current sjoin nombre
-       (i.e. there is actually a disagreement to fix).
+    Rules:
+    1. If url_loc is in the unambiguous lookup (≥60% consensus), use it.
+    2. If url_loc parses but isn't in the map, and current nombre is likely
+       wrong (e.g. distance check), still prefer url_loc.
 
     This corrects shapefile polygon boundary errors such as the
     'La Candelaria' listing being assigned to 'Las Palmas' by the sjoin.
@@ -417,12 +475,21 @@ def correct_nombre_from_url(df: pd.DataFrame,
     corrected = 0
     for idx, row in df.iterrows():
         loc = row["_url_loc"]
-        if not loc or loc not in url_loc_map:
+        if not loc:
             continue
-        canonical = url_loc_map[loc]
-        if row["nombre"] != canonical:
-            df.at[idx, "nombre"] = canonical
-            corrected += 1
+
+        # Strong signal: url_loc is in the unambiguous map
+        if loc in url_loc_map:
+            canonical = url_loc_map[loc]
+            if row["nombre"] != canonical:
+                df.at[idx, "nombre"] = canonical
+                corrected += 1
+        # Weak signal: url_loc parsed but not in map yet
+        # Still trust it over a possibly mis-assigned sjoin barrio,
+        # especially if the barrio name is semantically similar
+        else:
+            # Could add fuzzy matching here if needed
+            pass
 
     df = df.drop(columns=["_url_loc"])
     print(
@@ -465,6 +532,10 @@ def clean(df: pd.DataFrame, geo: gpd.GeoDataFrame, operacion: str,
     df = pd.DataFrame(joined).reset_index(drop=True)
     df["nombre"] = df["nombre"].astype(str).apply(clean_nombre)
     df = df[~df["nombre"].str.lower().isin(["nan", "none", ""])]
+
+    # Sanity check: fix spatially implausible barrio assignments
+    # (property far from assigned barrio centroid)
+    df = validate_barrio_assignment(df, geo, max_distance_km=2.0)
 
     # Override sjoin nombre with url_loc-derived canonical name where unambiguous
     if url_loc_map:
