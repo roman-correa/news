@@ -64,9 +64,6 @@ ARTIFACTS_DIR.mkdir(exist_ok=True)
 MEDELLIN_BOUNDS = dict(lat_min=6.10, lat_max=6.40,
                        lon_min=-75.70, lon_max=-75.45)
 
-# Buffer (degrees) around each neighborhood's observed bbox for
-# name ↔ coordinate validation (~550 m at this latitude)
-LOCATION_BBOX_BUFFER = 0.005
 
 # Metro de Medellín + Tranvía + Cables stations (name, lat, lon)
 METRO_STATIONS = [
@@ -278,7 +275,7 @@ def fix_coordinates(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _norm(s: str) -> str:
-    """Lowercase + strip accents + collapse whitespace — used for name matching."""
+    """Lowercase + strip accents + collapse whitespace."""
     s = str(s).lower().strip()
     s = unicodedata.normalize("NFD", s)
     s = "".join(c for c in s if unicodedata.category(c) != "Mn")
@@ -286,50 +283,155 @@ def _norm(s: str) -> str:
     return s
 
 
+# Municipalities in the Antioquia metro area that are NOT Medellín.
+# If the URL title names one of these, the listing is not in Medellín and
+# must be dropped regardless of where the coordinates happen to fall.
+_NON_MEDELLIN_MUNIS = {
+    "guarne", "envigado", "bello", "itagui", "sabaneta", "caldas",
+    "la estrella", "copacabana", "girardota", "barbosa", "retiro",
+    "el retiro", "rionegro", "marinilla", "el santuario", "la ceja",
+    "el carmen de viboral", "guatape", "san vicente", "anza", "heliconia",
+    "armenia", "bogota", "cali", "barranquilla", "cartagena", "santa marta",
+    "pereira", "manizales", "bucaramanga", "cucuta", "villavicencio",
+    "pasto", "ibague",
+}
+
+
+def _url_municipality(url: str) -> str | None:
+    """
+    Extract the location slug from a metrocuadrado /inmueble/ URL.
+
+    URL pattern:
+        /inmueble/{venta|arriendo}-{tipo}-{ciudad}-{location_slug}-{N}-habitaciones/…
+    Returns the normalised location slug (e.g. 'guarne', 'el poblado'),
+    or None for /proyecto/ URLs and listings with no barrio in the slug.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    m = re.search(
+        r"/inmueble/(?:venta|arriendo)-(?:apartamento|casa|lote|oficina|local|bodega|finca)"
+        r"-([a-z0-9-]+?)(?:-\d+-habitaciones|-\d+-banos|/)",
+        url,
+    )
+    if not m:
+        return None
+    parts = m.group(1).split("-")
+    if len(parts) < 2:
+        return None
+    loc = " ".join(parts[1:])   # drop the city prefix (e.g. 'medellin')
+    return _norm(loc) if loc and loc != "0" else None
+
+
 def validate_location_match(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Drop rows where the property's coordinates fall outside the bounding box
-    of its assigned neighborhood (nombre).
+    Drop rows where the URL title names a municipality outside Medellín.
 
-    Strategy
-    --------
-    1. Build a per-neighborhood bbox from the dataset itself — the spatial join
-       in clean() already assigned the official nombre from the shapefile, so
-       the bbox reflects the true geographic extent of each barrio.
-    2. Add a small buffer (LOCATION_BBOX_BUFFER degrees, ~550 m) to avoid
-       rejecting legitimate edge properties.
-    3. Properties whose nombre is not in the reference (shouldn't happen after
-       sjoin, but just in case) are kept.
+    Metrocuadrado embeds the location in the URL slug
+    (e.g. 'medellin-guarne', 'medellin-envigado').  When the slug contains
+    a known non-Medellín municipality the listing clearly does not belong
+    in this dataset — the spatial join may have placed it inside a border
+    barrio, but the source title is the authoritative signal.
+
+    Rules
+    -----
+    - /proyecto/ URLs have no barrio slug → cannot validate → kept.
+    - /inmueble/ URLs with no parseable location → kept.
+    - /inmueble/ URLs whose location slug contains a non-Medellín
+      municipality name → dropped.
+    - All other rows → kept.
     """
     before = len(df)
 
-    bbox = (
-        df.groupby("nombre")
-        .agg(lat_min=("latitud", "min"), lat_max=("latitud", "max"),
-             lon_min=("longitud", "min"), lon_max=("longitud", "max"))
-        .reset_index()
-    )
-    bbox["lat_min"] -= LOCATION_BBOX_BUFFER
-    bbox["lat_max"] += LOCATION_BBOX_BUFFER
-    bbox["lon_min"] -= LOCATION_BBOX_BUFFER
-    bbox["lon_max"] += LOCATION_BBOX_BUFFER
-    bbox_dict = bbox.set_index("nombre").to_dict("index")
+    def _is_non_medellin(url: str) -> bool:
+        loc = _url_municipality(url)
+        if loc is None:
+            return False
+        return any(muni in loc for muni in _NON_MEDELLIN_MUNIS)
 
-    def _ok(row):
-        b = bbox_dict.get(row["nombre"])
-        if b is None:
-            return True  # unknown nombre — keep
-        return (b["lat_min"] <= row["latitud"] <= b["lat_max"] and
-                b["lon_min"] <= row["longitud"] <= b["lon_max"])
-
-    mask = df.apply(_ok, axis=1)
+    mask = ~df["url"].apply(_is_non_medellin)
     dropped = before - mask.sum()
     print(f"    validate_location_match: dropped {dropped} rows "
-          f"(name↔coordinate mismatch)")
+          f"(URL title names a non-Medellín municipality)")
     return df[mask].reset_index(drop=True)
 
 
-def clean(df: pd.DataFrame, geo: gpd.GeoDataFrame, operacion: str) -> pd.DataFrame:
+def build_url_loc_nombre_map(df: pd.DataFrame) -> dict[str, str]:
+    """
+    Build a lookup of url_loc → official nombre from the dataset itself.
+
+    An url_loc is considered unambiguous if ≥ 60 % of its listings share
+    the same shapefile-assigned nombre and there are at least 5 listings
+    total.  This covers cases like:
+        'simesa'        → 'Villa Carlota'
+        'la linde'      → 'Lalinde'
+        'la candelaria' → 'La Candelaria'
+        'ciudad del rio'→ 'Villa Carlota'
+        'shellmar'      → 'Santa Fé'
+
+    Called once per pipeline run (inside run_pipeline) so both arriendo
+    and venta tables benefit from each other's signal.
+    """
+    df = df[df["url"].notna() & df["nombre"].notna()].copy()
+    df["_url_loc"] = df["url"].apply(_url_municipality)
+
+    counts = (
+        df[df["_url_loc"].notna()]
+        .groupby(["_url_loc", "nombre"])
+        .size()
+        .reset_index(name="n")
+    )
+    totals = counts.groupby("_url_loc")["n"].sum().rename("total")
+    counts = counts.join(totals, on="_url_loc")
+    counts["pct"] = counts["n"] / counts["total"]
+
+    dominant = (
+        counts.sort_values(["_url_loc", "n"], ascending=[True, False])
+        .groupby("_url_loc")
+        .first()
+        .reset_index()
+    )
+    dominant = dominant[(dominant["pct"] >= 0.60) & (dominant["total"] >= 5)]
+    mapping = dict(zip(dominant["_url_loc"], dominant["nombre"]))
+    print(
+        f"    build_url_loc_nombre_map: {len(mapping)} unambiguous url_loc→nombre entries")
+    return mapping
+
+
+def correct_nombre_from_url(df: pd.DataFrame,
+                            url_loc_map: dict[str, str]) -> pd.DataFrame:
+    """
+    Override the shapefile-assigned nombre with the url_loc-derived nombre
+    when the mapping is unambiguous.
+
+    Only overrides rows where:
+    1. The url_loc is in the unambiguous lookup.
+    2. The url_loc-derived nombre differs from the current sjoin nombre
+       (i.e. there is actually a disagreement to fix).
+
+    This corrects shapefile polygon boundary errors such as the
+    'La Candelaria' listing being assigned to 'Las Palmas' by the sjoin.
+    """
+    df = df.copy()
+    df["_url_loc"] = df["url"].apply(_url_municipality)
+
+    corrected = 0
+    for idx, row in df.iterrows():
+        loc = row["_url_loc"]
+        if not loc or loc not in url_loc_map:
+            continue
+        canonical = url_loc_map[loc]
+        if row["nombre"] != canonical:
+            df.at[idx, "nombre"] = canonical
+            corrected += 1
+
+    df = df.drop(columns=["_url_loc"])
+    print(
+        f"    correct_nombre_from_url: corrected {corrected} nombre assignments")
+    return df
+
+
+def clean(df: pd.DataFrame, geo: gpd.GeoDataFrame, operacion: str,
+          url_loc_map: dict[str, str] | None = None) -> pd.DataFrame:
     print(f"  Cleaning {operacion}: {len(df)} rows...")
 
     df = df.dropna(subset=["precio", "area", "habitaciones", "baños"])
@@ -364,7 +466,11 @@ def clean(df: pd.DataFrame, geo: gpd.GeoDataFrame, operacion: str) -> pd.DataFra
     df["nombre"] = df["nombre"].astype(str).apply(clean_nombre)
     df = df[~df["nombre"].str.lower().isin(["nan", "none", ""])]
 
-    # Drop properties whose coordinates don't match their assigned neighborhood
+    # Override sjoin nombre with url_loc-derived canonical name where unambiguous
+    if url_loc_map:
+        df = correct_nombre_from_url(df, url_loc_map)
+
+    # Drop properties whose URL title names a non-Medellín municipality
     df = validate_location_match(df)
 
     # Fill missing estrato with barrio median, then global median
@@ -696,8 +802,32 @@ def run_pipeline(skip_scrape: bool = False, mode: str = "both", fast: bool = Fal
 
         # Clean ───────────────────────────────────────────────────────────────
         print("\n[1/5] Cleaning...")
-        arr_clean = clean(arr_raw, geo, "arriendo")
-        ven_clean = clean(ven_raw, geo, "venta")
+
+        # Build url_loc → nombre map from the combined raw scrape so both
+        # arriendo and venta benefit from each other's signal
+        print("  Building url_loc→nombre map from raw data...")
+        _raw_combined = pd.concat([arr_raw, ven_raw], ignore_index=True)
+        # Do a lightweight sjoin on the combined raw data to get initial nombres
+        _gdf = gpd.GeoDataFrame(
+            _raw_combined.dropna(subset=["latitud", "longitud"]),
+            geometry=gpd.points_from_xy(
+                _raw_combined.dropna(subset=["latitud", "longitud"])[
+                    "longitud"],
+                _raw_combined.dropna(subset=["latitud", "longitud"])[
+                    "latitud"],
+            ),
+            crs="EPSG:4326",
+        )
+        _joined = _gdf.sjoin(geo.to_crs("EPSG:4326"), how="left")
+        _joined = _joined[~_joined.index.duplicated(keep="first")]
+        _joined.columns = _joined.columns.str.lower()
+        _joined["nombre"] = _joined["nombre"].astype(str).apply(clean_nombre)
+        _joined = _joined[~_joined["nombre"].str.lower().isin(
+            ["nan", "none", ""])]
+        url_loc_map = build_url_loc_nombre_map(pd.DataFrame(_joined))
+
+        arr_clean = clean(arr_raw, geo, "arriendo", url_loc_map)
+        ven_clean = clean(ven_raw, geo, "venta",    url_loc_map)
 
         # Feature engineering ─────────────────────────────────────────────────
         print("\n[2/5] Engineering features...")
